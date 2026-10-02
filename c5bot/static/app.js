@@ -11,6 +11,10 @@
   const pad = (n) => String(n).padStart(2, "0");
   const zhe = (d) => d == null ? "-" : `${(d * 10).toFixed(2)}折`;
   const zheCls = (d) => d == null ? "" : d <= 0.75 ? "up" : d >= 0.9 ? "down" : "";
+  // 美元区钱包：折 就是汇率（人民币 / 1 美元），5.5 以下算便宜，6.5 以上接近官方汇率没利润
+  const rateCls = (r) => r == null ? "" : r <= 5.5 ? "up" : r >= 6.5 ? "down" : "";
+  const usdWallet = () => !!(state && state.usd_wallet);
+  const cur = (v, d = 2) => (usdWallet() && v != null ? "$" : "") + num(v, d);
   const badge = (text, cls) => `<span class="badge ${cls}">${esc(text)}</span>`;
   const STATUS = { hit: ["到价", "hit"], watch: ["监控中", "watch"], cooldown: ["冷却", "cooldown"], done: ["已买满", "done"], unknown: ["无行情", "fail"], nosteam: ["等 Steam 价", "warn"] };
   const PSTATUS = { ok: ["成交", "ok"], unknown: ["未知", "warn"], failed: ["失败", "fail"], cancelled: ["已取消", "muted"] };
@@ -128,12 +132,16 @@
       s.steam.blocked_for > 0
         ? tile("Steam 价", "限流中", `Steam 429，约 ${Math.ceil(s.steam.blocked_for / 60)} 分钟后自动重试，期间沿用旧价`, "down small")
         : tile("Steam 价", s.steam.at ? ago(s.steam.at) : "未拉取", `每 ${Math.round(s.steam_refresh_sec / 60)} 分钟刷新`),
-      sr
-        ? tile("Steam 汇率", `${num(sr.rate, 3)} <span class="muted">元/USD</span>`, `按 ${esc(sr.name)} ¥${num(sr.cny)} / $${num(sr.usd)} · ${ago(sr.at)}`)
-        : tile("Steam 汇率", "未知", r.steam_error ? esc(r.steam_error) : "等第一次 Steam 刷新", "small"),
+      usdWallet()
+        ? tile("钱包币种", "美元区", "Steam 价和到手都是美元，C5 人民币价 ÷ 到手美元 = 汇率", "small")
+        : sr
+          ? tile("Steam 汇率", `${num(sr.rate, 3)} <span class="muted">元/USD</span>`, `按 ${esc(sr.name)} ¥${num(sr.cny)} / $${num(sr.usd)} · ${ago(sr.at)}`)
+          : tile("Steam 汇率", "未知", r.steam_error ? esc(r.steam_error) : "等第一次 Steam 刷新", "small"),
       r.target != null
         ? tile("目标汇率", `${num(r.target)} <span class="muted">元/USD</span>`,
-          r.discount != null ? `= ${zhe(r.discount)}，目标价随 Steam 价自动算` : "等 Steam 汇率后生效，期间不买", r.discount != null ? "" : "small")
+          usdWallet() ? `目标价 = 到手美元 × ${num(r.target)}，随 Steam 价自动算`
+            : r.discount != null ? `= ${zhe(r.discount)}，目标价随 Steam 价自动算` : "等 Steam 汇率后生效，期间不买",
+          usdWallet() || r.discount != null ? "" : "small")
         : tile("目标汇率", "未设置", "目标价用 watchlist 里的 max_price", "small"),
     ];
     const hits = s.items.filter((i) => i.status === "hit");
@@ -160,6 +168,7 @@
       $("#items").innerHTML = `<div class="empty">watchlist 为空</div>`;
       return;
     }
+    const usd = usdWallet();
     const rows = s.items.map((i) => {
       const [text, cls] = STATUS[i.status] || [i.status, "muted"];
       const cool = i.status === "cooldown" && i.pause_until ? `<div class="sub-cell">${Math.max(0, Math.round(i.pause_until - s.now))}s</div>` : "";
@@ -177,12 +186,13 @@
         <td>${num(i.c5_target)}${targetSub}</td>
         <td>${int(i.sell_count)}</td>
         <td>${num(i.purchase_max)}</td>
-        <td>${num(i.steam_lowest)}${steamSub}</td>
-        <td>${num(i.steam_sell)}${sellSub}</td>
-        <td>${num(i.steam_net)}</td>
-        <td class="${zheCls(i.discount_at_lowest)}">${zhe(i.discount_at_lowest)}</td>
-        <td class="${zheCls(i.discount_at_lowest)}">${num(i.rate_at_lowest)}</td>
-        <td class="${zheCls(i.discount_at_target)}">${zhe(i.discount_at_target)}</td>
+        <td>${cur(i.steam_lowest)}${steamSub}</td>
+        <td>${cur(i.steam_sell)}${sellSub}</td>
+        <td>${cur(i.steam_net)}</td>
+        ${usd ? "" : `<td class="${zheCls(i.discount_at_lowest)}">${zhe(i.discount_at_lowest)}</td>`}
+        <td class="${rateCls(i.rate_at_lowest)}">${num(i.rate_at_lowest)}</td>
+        ${usd ? `<td class="${rateCls(i.rate_at_target)}">${num(i.rate_at_target)}</td>`
+              : `<td class="${zheCls(i.discount_at_target)}">${zhe(i.discount_at_target)}</td>`}
         <td>${i.bought} / ${i.max_qty}</td>
         <td>${num(i.spent)}${spendCap}</td>
       </tr>`;
@@ -191,7 +201,8 @@
       <thead><tr>
         <th class="l">箱子</th><th class="l">状态</th><th>C5 最低</th><th>目标价</th><th>在售</th><th>求购最高</th>
         <th>Steam 最低</th><th title="算净到手用的卖出价：登录 Steam 后是最近几天成交历史的最高小时中位价，否则是当前最低挂单价">挂单价</th><th>净到手</th>
-        <th>折(C5最低)</th><th title="按 C5 最低价买入，1 美元 Steam 余额花多少人民币">汇率(C5最低)</th><th>折(目标价)</th><th>已买</th><th>已花</th>
+        ${usd ? "" : "<th>折(C5最低)</th>"}<th title="按 C5 最低价买入，1 美元 Steam 余额花多少人民币">汇率(C5最低)</th>
+        ${usd ? `<th title="按目标价买入，1 美元 Steam 余额花多少人民币">汇率(目标价)</th>` : "<th>折(目标价)</th>"}<th>已买</th><th>已花</th>
       </tr></thead><tbody>${rows.join("")}</tbody></table>`;
   }
 

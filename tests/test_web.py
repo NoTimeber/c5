@@ -348,6 +348,42 @@ def test_refresh_uses_history_sell_price_when_logged_in(env, monkeypatch):
     assert sweeper.auto_targets[CASE.name] == int(1.02 * disc * 100 + 1e-9) / 100
 
 
+def test_usd_wallet_mode(tmp_path, monkeypatch):
+    """卖货账号是美元区：Steam 价、净到手都是美元，不量 Steam 汇率，目标价 = 到手美元 × 目标汇率。"""
+    s = Settings(app_key="k", mode="dry", data_dir=tmp_path, steam_currency=USD)
+    client, store = FakeClient(), Store(tmp_path / "t.sqlite")
+    client.stats = {CASE.name: {"sellPrice": 0.65, "sellCount": 10}}
+    client.listings = [listing(1, 0.65)]
+    sweeper = Sweeper(s, [CASE], client, store, clock=Clock())
+    dash = Dashboard(s, sweeper, tmp_path / "t.sqlite", LogBuffer(), watchlist_path=tmp_path / "w.toml")
+    web = TestClient(create_app(dash))
+    calls = []
+
+    def fake_price(app_id, name, *, currency=None):
+        calls.append((name, currency))
+        return SteamPrice(0.17, 0.17, 80000)   # 美元
+    monkeypatch.setattr(dash._steam, "price", fake_price)
+    now = time.time()
+    monkeypatch.setattr(dash._steam, "price_history",
+                        lambda app_id, name: PriceHistory([HistoryPoint(now - 3600, 0.181, 9035)], "$"))
+    dash._set_session(session())
+    dash.set_target_rate(5.2)
+    dash.refresh_steam()
+    assert calls == [(CASE.name, None)]          # 不量 Steam 汇率
+    assert dash.steam_rate is None and dash.discount() == pytest.approx(5.2)
+    sweeper.run_cycle()
+    st = web.get("/api/state").json()
+    assert st["usd_wallet"] is True and st["rate"]["steam"] is None and st["rate"]["discount"] == pytest.approx(5.2)
+    kilo = st["items"][0]
+    # 美元区账号的历史不换算：挂单价 $0.181，到手 $0.16（18 分，两项手续费各扣最低 1 分）
+    assert kilo["steam_sell"] == 0.181 and kilo["sell_usd"] is None and kilo["steam_net"] == pytest.approx(0.16)
+    # 汇率 = C5 人民币价 ÷ 到手美元
+    assert kilo["rate_at_lowest"] == pytest.approx(0.65 / 0.16)
+    # 目标价 = 到手美元 × 目标汇率 = 0.16 × 5.2 = 0.832 -> 0.83
+    assert kilo["c5_target"] == 0.83 and kilo["rate_at_target"] == pytest.approx(0.83 / 0.16)
+    assert kilo["status"] == "hit" and len(st["purchases"]) == 1
+
+
 def test_access_token_renewed_before_expiry(env, monkeypatch):
     dash, sweeper, client, web = env
     dash._set_session(session(access_exp=time.time() + 600))   # 10 分钟后过期

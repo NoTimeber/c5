@@ -13,7 +13,7 @@ from . import __version__
 from .client import C5Client, C5Error
 from .compare import SteamRate, append_csv, c5_lowest, compare_row, fetch_steam_rate
 from .config import Settings, WatchItem, load_settings, load_watchlist
-from .steam import SteamError, SteamMarket, SteamPrice
+from .steam import USD, SteamError, SteamMarket, SteamPrice
 from .store import Store
 from .sweeper import Sweeper, parse_listing
 from .web import Dashboard, LogBuffer, create_app, serve_in_thread
@@ -111,23 +111,28 @@ def cmd_compare(s: Settings, every: float) -> int:
             except SteamError as e:
                 failed.append((it, c5, str(e)))
         rate: SteamRate | None = None
-        try:
-            rate = fetch_steam_rate(steam, s.steam_rate_item)
-        except SteamError as e:
-            print(f"Steam 汇率查询失败: {e}")
+        usd = s.steam_currency == USD   # 卖货账号是美元区：Steam 价就是美元，折 列直接就是汇率
+        if not usd:
+            try:
+                rate = fetch_steam_rate(steam, s.steam_rate_item)
+            except SteamError as e:
+                print(f"Steam 汇率查询失败: {e}")
+        fmt = (lambda d: f"{d:.2f}" if d else "-") if usd else _fmt_discount
         print(f"\n{now}  Steam 价为当前最低挂单价，净到手 = 扣 Steam 5% + CS2 10% 手续费后。"
               f"C5 买到的 7 天后才能挂 Steam，折扣按今天价算，仅供参考。")
-        if rate:
+        if usd:
+            print("钱包是美元区：Steam 价和净到手都是美元，汇率 = C5 人民币价 ÷ 到手美元。")
+        elif rate:
             print(f"Steam 汇率 {rate.rate:.4f} 元/USD（{rate.name} ¥{rate.cny:.2f} / ${rate.usd:.2f}）。"
                   f"汇率(C5最低) = 按 C5 最低价买入，1 美元 Steam 余额花多少人民币。")
-        print(_row(["箱子", "C5最低", "目标价", "Steam最低", "净到手", "折(C5最低)", "汇率(C5最低)", "折(目标价)",
-                    "Steam中位", "24h成交"], widths))
+        print(_row(["箱子", "C5最低", "目标价", "Steam最低", "净到手", "汇率(C5最低)" if usd else "折(C5最低)",
+                    "汇率(C5最低)", "汇率(目标价)" if usd else "折(目标价)", "Steam中位", "24h成交"], widths))
         rows = []
         for it, c5, sp in priced:
-            r = compare_row(it, c5, sp, rate=rate.rate if rate else None)
+            r = compare_row(it, c5, sp, rate=1.0 if usd else (rate.rate if rate else None))
             rows.append(r)
             print(_row([r.name, r.c5_lowest, r.c5_target, r.steam_lowest, r.steam_net,
-                        _fmt_discount(r.discount_at_lowest), r.rate_at_lowest, _fmt_discount(r.discount_at_target),
+                        fmt(r.discount_at_lowest), r.rate_at_lowest, fmt(r.discount_at_target),
                         r.steam_median, r.steam_volume], widths))
         for it, c5, err in failed:
             print(_row([it.name, c5], widths[:2]) + f"  Steam 查询失败: {err}")

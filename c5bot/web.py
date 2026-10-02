@@ -156,7 +156,7 @@ class Dashboard:
             self.steam_at = time.time()
             self._apply_targets()
             stats = self.sweeper.view.get("stats") or {}
-            rate = self.steam_rate.rate if self.steam_rate else None
+            rate = self._rate_for_rows()
             rows = [compare_row(it, c5_lowest(stats.get(it.name)), sp, target=self.sweeper.target(it), rate=rate,
                                 sell=self.sell_basis(it)[0])
                     for it, sp in fresh]
@@ -198,9 +198,14 @@ class Dashboard:
                                  "at": time.time(), "error": None}
         return True
 
+    @property
+    def usd_wallet(self) -> bool:
+        """卖货账号是美元区：Steam 价、净到手都是美元，C5 人民币价 ÷ 到手美元就是汇率，不用再量 Steam 换算率。"""
+        return self.s.steam_currency == USD
+
     def _refresh_rate(self) -> None:
         """用参照饰品查人民币价和美元价算 Steam 汇率，最多每 RATE_REFRESH_SEC 量一次。失败就沿用上次的值。"""
-        if self._stop.is_set() or self._steam.blocked_for > 0:
+        if self.usd_wallet or self._stop.is_set() or self._steam.blocked_for > 0:
             return
         if self.steam_rate and time.time() - self.steam_rate.at < RATE_REFRESH_SEC:
             return
@@ -338,8 +343,16 @@ class Dashboard:
                      f"，相当于 {disc * 10:.2f} 折" if disc else "，等拿到 Steam 汇率后生效")
 
     def discount(self) -> float | None:
-        """目标汇率对应的折扣。"""
+        """目标汇率对应的折扣。美元区钱包时 Steam 价就是美元，折扣 = 目标汇率本身（目标价 = 到手美元 × 目标汇率）。"""
+        if self.usd_wallet:
+            return rate_discount(self.target_rate, 1.0)
         return rate_discount(self.target_rate, self.steam_rate.rate if self.steam_rate else None)
+
+    def _rate_for_rows(self) -> float | None:
+        """给 compare_row 的换算率：美元区钱包是 1（折 × 1 = 汇率），否则是量出来的 Steam 汇率。"""
+        if self.usd_wallet:
+            return 1.0
+        return self.steam_rate.rate if self.steam_rate else None
 
     def sell_basis(self, it) -> tuple[float | None, str]:
         """算净到手用的 Steam 卖出价：登录后用成交历史里的挂单价（新鲜的），否则用当前最低挂单价。"""
@@ -391,7 +404,7 @@ class Dashboard:
         finally:
             store.close()
         now = time.time()
-        rate = self.steam_rate.rate if self.steam_rate else None
+        rate = self._rate_for_rows()
         auto = sw.auto_targets is not None
         items = []
         for it in sw.items:
@@ -432,6 +445,7 @@ class Dashboard:
             "mode": self.s.mode, "strategy": self.s.strategy, "paused": sw.paused,
             "poll_interval": self.s.poll_interval, "steam_refresh_sec": self.s.steam_refresh_sec,
             "sell_window_days": self.s.steam_sell_window_days,
+            "steam_currency": self.s.steam_currency, "usd_wallet": self.usd_wallet,
             "cycle": {"n": self.cycle_n, "at": self.cycle_at, "error": self.cycle_error,
                       "done": bool(view.get("done"))},
             "budget": {"total": self.s.max_total_spend,
