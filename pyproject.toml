@@ -1,6 +1,6 @@
 [project]
 name = "c5-case-sweeper"
-version = "0.3.3"
+version = "0.4.0"
 description = "C5GAME 开放平台武器箱行情监控 + 扫货"
 requires-python = ">=3.12"
 dependencies = [
@@ -13,6 +13,7 @@ dependencies = [
     "fastapi>=0.115",
     "uvicorn>=0.30",
     "rsa>=4.9",
+    "pysocks>=1.7",
 ]
 
 [dependency-groups]

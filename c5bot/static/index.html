@@ -66,6 +66,13 @@
       <button class="ghost primary" id="steam-code-btn" type="submit">提交验证码</button>
       <button class="ghost" type="button" id="steam-cancel">取消</button>
     </form>
+    <form class="login-form proxy-form" id="proxy-form" title="只有 Steam 的行情、成交历史、汇率请求走代理；登录 Steam 和续期直连。轮转住宅代理每个请求换出口 IP，Steam 按 IP 的限流就不再是问题">
+      <label for="proxy-input">Steam 代理</label>
+      <input id="proxy-input" type="text" autocomplete="off" spellcheck="false" placeholder="http://用户名:密码@地址:端口 或 socks5://…">
+      <button class="ghost primary" type="submit">应用</button>
+      <button class="ghost" type="button" id="proxy-clear" hidden>清除</button>
+      <span class="muted" id="proxy-status">-</span>
+    </form>
   </section>
 
   <div class="two-col">

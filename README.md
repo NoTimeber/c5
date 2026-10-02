@@ -191,7 +191,7 @@ docker run -d --name watchtower --restart unless-stopped \
 - 服务器在国内拉不动 `ghcr.io` 的话，改推阿里云容器镜像服务（个人版免费）：在 GitHub 仓库 Settings → Secrets and variables → Actions 设 Variables `C5_REGISTRY`、`C5_IMAGE` 和 Secrets `C5_REGISTRY_USER`、`C5_REGISTRY_PASSWORD`；服务器安装时传 `C5BOT_IMAGE=<阿里云镜像名>` 和阿里云账号的 `GHCR_USER` / `GHCR_TOKEN`（变量名沿用，登录的是镜像名里的那个注册表）。
 - `compose.yaml` 由脚本管理，每次 `upgrade` 覆盖，别在服务器上手改；所有自定义都放 `.env`。改 `watchlist.toml` 不用重启，看板上点“重载 watchlist”；改 `.env` 跑 `restart`。
 - 只看行情不买：`.env` 里 `C5_START_PAUSED=yes`，在看板上点“继续扫货”才开始买。
-- Steam 市场接口对匿名请求限流严，云服务器的 IP 更容易被 429。被限流后看板 5 分钟内不再请求 Steam（连续被限翻倍到最多 1 小时），期间沿用旧价，“Steam 价”卡片会显示限流中并自动重试；Steam 汇率每小时才重新量一次，手动“刷新 Steam 价”至少间隔 1 分钟。频繁被限流就配 `STEAM_PROXY`，推荐轮转住宅代理（`http://用户名:密码@代理地址:端口`，每个请求换出口 IP，退避时间也会自动缩短到 30 秒），或调大 `STEAM_REFRESH_SEC`。看板上登录 Steam 和续期不走这个代理。
+- Steam 市场接口对匿名请求限流严，云服务器的 IP 更容易被 429。被限流后看板 5 分钟内不再请求 Steam（连续被限翻倍到最多 1 小时），期间沿用旧价，“Steam 价”卡片会显示限流中并自动重试；Steam 汇率每小时才重新量一次，手动“刷新 Steam 价”至少间隔 1 分钟。频繁被限流就配代理，推荐轮转住宅代理（`http://用户名:密码@代理地址:端口`，每个请求换出口 IP，退避时间也会自动缩短到 30 秒），或调大 `STEAM_REFRESH_SEC`。代理可以写在 `.env` 的 `STEAM_PROXY`，也可以直接在看板“Steam 账号”卡片里填：应用时先通过代理测出口 IP，通了才保存并立即生效，存在 `data/dashboard.json`，优先于 `.env`，点清除回退。看板上登录 Steam 和续期不走代理。
 - `docker stop` 发 SIGTERM，程序按 Ctrl+C 同样的路径退出；正在发的下单请求最坏也就是记成“结果未知”，下次启动自动对账。
 - 不经过 CI 在本机 build：`docker compose -f compose.yaml -f compose.build.yaml up -d --build`。
 - 本机没装 Docker 也没有 bash，Dockerfile、workflow、install.sh 都没有实际跑过；第一次失败的话把输出贴出来。

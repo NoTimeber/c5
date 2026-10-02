@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import time
 from collections import deque
@@ -34,7 +35,17 @@ from .compare import (
     target_price,
 )
 from .config import ROOT, Settings, load_watchlist
-from .steam import USD, SteamError, SteamLoginRequired, SteamMarket, fmt_wait, sell_price_from_history
+from .steam import (
+    USD,
+    SteamError,
+    SteamLoginRequired,
+    SteamMarket,
+    check_proxy_url,
+    fmt_wait,
+    mask_proxy,
+    probe_proxy,
+    sell_price_from_history,
+)
 from .steam_login import GUARD_NAMES, SteamAuth, SteamLoginError, SteamSession, load_session, renew, save_session
 from .store import Store
 from .sweeper import Sweeper
@@ -84,12 +95,15 @@ class Dashboard:
         self.steam_busy = False
         self.steam_rate: SteamRate | None = None    # Steam 内部人民币/美元换算率
         self.steam_rate_error: str | None = None
-        self._steam = SteamMarket(proxy=settings.steam_proxy, currency=settings.steam_currency,
+        self._prefs = self._load_prefs()         # 看板上改的设置：目标汇率、Steam 代理
+        self.target_rate: float | None = self._prefs.get("target_rate")
+        self.proxy_override: str | None = self._prefs.get("steam_proxy") or None
+        self.proxy_exit_ip: str | None = None
+        self._steam = SteamMarket(proxy=self.effective_proxy, currency=settings.steam_currency,
                                   timeout=settings.timeout)
         self._client = C5Client(settings.app_key, proxy=settings.proxy, timeout=settings.timeout)
         self._refresh_now = threading.Event()
         self._stop = threading.Event()
-        self.target_rate: float | None = self._load_target_rate()
         self.steam_session: SteamSession | None = load_session(self._session_path)
         self.steam_login_error: str | None = None
         self._auth: SteamAuth | None = None      # 进行中的 Steam 登录
@@ -324,19 +338,64 @@ class Dashboard:
         log.warning("Steam 登录态失效: %s", reason)
         return False
 
-    # ---------- 目标汇率 ----------
+    # ---------- 看板设置（data/dashboard.json） ----------
 
-    def _load_target_rate(self) -> float | None:
+    def _load_prefs(self) -> dict:
         try:
-            v = json.loads(self._settings_path.read_text(encoding="utf-8")).get("target_rate")
-            return float(v) if v is not None and RATE_MIN <= float(v) <= RATE_MAX else None
-        except (OSError, ValueError, AttributeError):
-            return None
+            d = json.loads(self._settings_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        if not isinstance(d, dict):
+            return {}
+        rate = d.get("target_rate")
+        try:
+            rate = float(rate) if rate is not None and RATE_MIN <= float(rate) <= RATE_MAX else None
+        except (TypeError, ValueError):
+            rate = None
+        proxy = d.get("steam_proxy")
+        return {"target_rate": rate, "steam_proxy": str(proxy) if proxy else None}
+
+    def _save_prefs(self) -> None:
+        self._prefs = {"target_rate": self.target_rate, "steam_proxy": self.proxy_override}
+        self._settings_path.write_text(json.dumps(self._prefs), encoding="utf-8")
+        try:  # 代理地址里有密码
+            os.chmod(self._settings_path, 0o600)
+        except OSError:
+            pass
+
+    # ---------- Steam 代理 ----------
+
+    @property
+    def effective_proxy(self) -> str | None:
+        """实际用的 Steam 代理：看板上设的优先，其次 .env 的 STEAM_PROXY。"""
+        return self.proxy_override or self.s.steam_proxy
+
+    @property
+    def proxy_source(self) -> str | None:
+        return "dashboard" if self.proxy_override else "env" if self.s.steam_proxy else None
+
+    def set_proxy(self, proxy: str | None) -> str | None:
+        """看板上设置 / 清除 Steam 代理。设置前先通过代理测一次出口 IP，连不通就不保存。返回出口 IP。"""
+        ip = None
+        if proxy:
+            proxy = check_proxy_url(proxy)
+            ip = probe_proxy(proxy, timeout=self.s.timeout)
+        self.proxy_override = proxy or None
+        self.proxy_exit_ip = ip
+        self._save_prefs()
+        self._steam.set_proxy(self.effective_proxy)
+        if proxy:
+            log.info("看板：Steam 代理改为 %s，出口 IP %s", mask_proxy(proxy), ip)
+        else:
+            log.info("看板：清除 Steam 代理，%s", f"回退到 .env 的 {mask_proxy(self.s.steam_proxy)}" if self.s.steam_proxy else "改为直连")
+        return ip
+
+    # ---------- 目标汇率 ----------
 
     def set_target_rate(self, rate: float | None) -> None:
         """看板上设置 / 清除目标汇率，写进 data/dashboard.json。"""
         self.target_rate = rate
-        self._settings_path.write_text(json.dumps({"target_rate": rate}), encoding="utf-8")
+        self._save_prefs()
         self._apply_targets()
         if rate is None:
             log.info("看板：清除目标汇率，目标价用 watchlist 的 max_price")
@@ -457,6 +516,8 @@ class Dashboard:
                        "qty": sum(t.qty for t in totals.values())},
             "balance": {"value": self.balance, "at": self.balance_at},
             "steam": {"at": self.steam_at, "busy": self.steam_busy, "blocked_for": self.steam_blocked_for},
+            "proxy": {"active": mask_proxy(self.effective_proxy), "source": self.proxy_source,
+                      "exit_ip": self.proxy_exit_ip},
             "steam_login": {"account": sess.account if sess else None, "steamid": sess.steamid if sess else None,
                             "access_exp": sess.access_exp if sess else None,
                             "refresh_exp": sess.refresh_exp if sess else None,
@@ -555,6 +616,17 @@ def create_app(dash: Dashboard) -> FastAPI:
                                 status_code=400)
         dash.set_target_rate(rate)
         return JSONResponse({"ok": True, "rate": rate})
+
+    @app.post("/api/proxy")
+    async def set_proxy(request: Request) -> JSONResponse:
+        """body: {"proxy": "http://user:pass@host:port"} 设置 Steam 代理（先测通）；{"proxy": null} 清除，回退到 .env。"""
+        raw = (await _json_body(request)).get("proxy")
+        proxy = str(raw).strip() if raw else None
+        try:
+            ip = await run_in_threadpool(dash.set_proxy, proxy)
+        except SteamError as e:
+            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+        return JSONResponse({"ok": True, "active": mask_proxy(dash.effective_proxy), "exit_ip": ip})
 
     # ---- Steam 登录：这几个会去请求 Steam，放线程池里跑，不卡看板 ----
 

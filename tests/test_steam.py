@@ -12,8 +12,10 @@ from c5bot.steam import (
     SteamError,
     SteamLoginRequired,
     SteamMarket,
+    check_proxy_url,
     discount,
     fmt_wait,
+    mask_proxy,
     parse_history_time,
     parse_money,
     sell_price_from_history,
@@ -77,6 +79,24 @@ def test_proxy_shortens_interval_and_backoff():
     assert (via._interval, via._block_sec) == (MIN_INTERVAL_PROXY, BLOCK_SEC_PROXY)
     assert via._http.proxies == {"http": "http://u:p@proxy.example.com:1337", "https": "http://u:p@proxy.example.com:1337"}
     assert via._auth_http.proxies == via._http.proxies
+    # 运行时切换：换了出口，限流状态重置
+    direct._blocked_until = direct._now() + 100
+    direct.set_proxy("socks5://proxy.example.com:1080")
+    assert direct.proxy == "socks5://proxy.example.com:1080" and direct.blocked_for == 0
+    assert direct._interval == MIN_INTERVAL_PROXY and direct._http.proxies["https"] == "socks5://proxy.example.com:1080"
+    direct.set_proxy(None)
+    assert direct.proxy is None and direct._http.proxies == {} and direct._interval == MIN_INTERVAL
+
+
+def test_proxy_url_check_and_mask():
+    assert check_proxy_url("  http://u:p@proxy.example.com:1337 ") == "http://u:p@proxy.example.com:1337"
+    assert check_proxy_url("socks5://proxy.example.com:1080") == "socks5://proxy.example.com:1080"
+    for bad in ("proxy.example.com:1337", "ftp://x:1", "http://", "http://h:notaport"):
+        with pytest.raises(SteamError):
+            check_proxy_url(bad)
+    assert mask_proxy("http://Tim_pool-x:secret@proxy.example.com:1337") == "http://Tim_pool-x:***@proxy.example.com:1337"
+    assert mask_proxy("socks5://proxy.example.com:1080") == "socks5://proxy.example.com:1080"
+    assert mask_proxy(None) is None
 
 
 def test_fmt_wait():

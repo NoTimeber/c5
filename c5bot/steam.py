@@ -5,6 +5,7 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from urllib.parse import urlsplit
 
 import requests
 
@@ -126,32 +127,79 @@ def fmt_wait(sec: float) -> str:
     return f"{-(-sec // 60)} 分钟" if sec >= 60 else f"{sec} 秒"
 
 
+PROXY_SCHEMES = ("http", "https", "socks5", "socks5h")
+IP_ECHO = "https://api.ipify.org"
+
+
+def check_proxy_url(proxy: str) -> str:
+    """看板上填的代理地址：去空白，校验格式。返回规范化后的地址，不合法抛 SteamError。"""
+    proxy = proxy.strip()
+    u = urlsplit(proxy)
+    if u.scheme not in PROXY_SCHEMES or not u.hostname:
+        raise SteamError("代理地址格式应为 http://用户名:密码@地址:端口 或 socks5://…")
+    try:
+        u.port
+    except ValueError:
+        raise SteamError("代理端口不对") from None
+    return proxy
+
+
+def mask_proxy(proxy: str | None) -> str | None:
+    """显示用：把密码换成 ***。"""
+    if not proxy:
+        return None
+    u = urlsplit(proxy)
+    if u.password is None:
+        return proxy
+    auth = f"{u.username}:***@"
+    return f"{u.scheme}://{auth}{u.hostname}{':' + str(u.port) if u.port else ''}{u.path}"
+
+
+def probe_proxy(proxy: str, timeout: float = 15.0) -> str:
+    """通过代理访问一次 IP 回显服务，返回出口 IP；连不通抛 SteamError。"""
+    try:
+        r = requests.get(IP_ECHO, proxies={"http": proxy, "https": proxy}, timeout=timeout,
+                         headers={"User-Agent": USER_AGENT})
+    except requests.RequestException as e:
+        raise SteamError(f"代理连不通: {type(e).__name__}") from None
+    if r.status_code != 200 or not r.text.strip():
+        raise SteamError(f"代理测试失败: HTTP {r.status_code}")
+    return r.text.strip()
+
+
 class SteamMarket:
     def __init__(self, *, proxy: str | None = None, currency: int = 23, timeout: float = 10.0,
                  clock=time.monotonic):
         # 两个会话：行情用匿名的，成交历史用带登录 cookie 的。登录 cookie 只发给必须登录的接口，
         # 实测带着 cookie 查行情会被 Steam 按账号限流，匿名反而没事
-        self._http = self._session(proxy)
-        self._auth_http = self._session(proxy)
+        self._http = self._session()
+        self._auth_http = self._session()
         self._currency = currency
         self._timeout = timeout
         self._now = clock
         self._last = 0.0
-        self._interval = MIN_INTERVAL_PROXY if proxy else MIN_INTERVAL
         self._blocked_until = 0.0       # 被限流后这个时间之前不再请求
-        self._block_base = BLOCK_SEC_PROXY if proxy else BLOCK_SEC
-        self._block_sec = self._block_base  # 下次被限流退避多久，连续被限流翻倍
         self.logged_in = False
+        self.proxy: str | None = None
+        self.set_proxy(proxy)
 
     @staticmethod
-    def _session(proxy: str | None) -> requests.Session:
+    def _session() -> requests.Session:
         s = requests.Session()
         s.headers["User-Agent"] = USER_AGENT
         # 实测 Accept-Encoding 里只要有 br，Steam 就直接回 429；requests 装了 brotli 后默认会带上
         s.headers["Accept-Encoding"] = "gzip, deflate"
-        if proxy:
-            s.proxies = {"http": proxy, "https": proxy}
         return s
+
+    def set_proxy(self, proxy: str | None) -> None:
+        """切换 / 清除代理（看板上改了代理时调用）。换了出口 IP，限流退避状态一并重置。"""
+        self.proxy = proxy or None
+        for s in (self._http, self._auth_http):
+            s.proxies = {"http": proxy, "https": proxy} if proxy else {}
+        self._interval = MIN_INTERVAL_PROXY if proxy else MIN_INTERVAL
+        self._block_base = BLOCK_SEC_PROXY if proxy else BLOCK_SEC
+        self._block_sec = self._block_base  # 下次被限流退避多久，连续被限流翻倍
+        self._blocked_until = 0.0
 
     @property
     def blocked_for(self) -> float:

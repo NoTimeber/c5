@@ -116,7 +116,7 @@ def test_set_target_rate_computes_targets_and_persists(env, tmp_path):
     assert sweeper.auto_targets is None
 
     assert web.post("/api/rate", json={"rate": 5.04}).json() == {"ok": True, "rate": 5.04}
-    assert (tmp_path / "dashboard.json").read_text(encoding="utf-8") == '{"target_rate": 5.04}'
+    assert json.loads((tmp_path / "dashboard.json").read_text(encoding="utf-8"))["target_rate"] == 5.04
     # 5.04 / 7.2 = 0.7 折；Kilowatt 到手 1.02 × 0.7 = 0.714 -> 0.71；Revolution 没有 Steam 价 -> None
     assert sweeper.auto_targets == {CASE.name: 0.71, OTHER.name: None}
     sweeper.run_cycle()
@@ -135,6 +135,53 @@ def test_set_target_rate_computes_targets_and_persists(env, tmp_path):
     st = web.get("/api/state").json()
     assert st["items"][0]["c5_target"] == 0.7 and st["items"][0]["target_auto"] is False
     assert st["items"][1]["status"] == "watch"
+
+
+def test_set_proxy_from_dashboard(env, tmp_path, monkeypatch):
+    dash, sweeper, client, web = env
+    probes = []
+
+    def fake_probe(proxy, timeout=15.0):
+        probes.append(proxy)
+        if "dead" in proxy:
+            raise SteamError("代理连不通: ConnectTimeout")
+        return "82.40.98.24"
+    monkeypatch.setattr("c5bot.web.probe_proxy", fake_probe)
+    assert web.get("/api/state").json()["proxy"] == {"active": None, "source": None, "exit_ip": None}
+
+    r = web.post("/api/proxy", json={"proxy": "proxy.example.com:1337"})
+    assert r.status_code == 400 and "格式" in r.json()["error"] and probes == []
+    r = web.post("/api/proxy", json={"proxy": "http://u:p@dead.example.com:1337"})
+    assert r.status_code == 400 and "连不通" in r.json()["error"]
+    assert dash.proxy_override is None and dash._steam.proxy is None
+
+    r = web.post("/api/proxy", json={"proxy": " http://Tim:secret@proxy.example.com:1337 "})
+    assert r.json() == {"ok": True, "active": "http://Tim:***@proxy.example.com:1337", "exit_ip": "82.40.98.24"}
+    assert dash._steam.proxy == "http://Tim:secret@proxy.example.com:1337"
+    assert dash._steam._http.proxies["https"] == "http://Tim:secret@proxy.example.com:1337"
+    st = web.get("/api/state").json()
+    assert st["proxy"] == {"active": "http://Tim:***@proxy.example.com:1337", "source": "dashboard", "exit_ip": "82.40.98.24"}
+    assert "secret" not in json.dumps(st)          # 密码不回显
+    saved = json.loads((tmp_path / "dashboard.json").read_text(encoding="utf-8"))
+    assert saved["steam_proxy"] == "http://Tim:secret@proxy.example.com:1337"
+    # 设目标汇率不会把代理冲掉，反之亦然
+    web.post("/api/rate", json={"rate": 5.0})
+    saved = json.loads((tmp_path / "dashboard.json").read_text(encoding="utf-8"))
+    assert saved == {"target_rate": 5.0, "steam_proxy": "http://Tim:secret@proxy.example.com:1337"}
+    # 重启后两样都在
+    dash2 = Dashboard(dash.s, sweeper, tmp_path / "t.sqlite", LogBuffer(), watchlist_path=tmp_path / "watchlist.toml")
+    assert dash2.target_rate == 5.0 and dash2._steam.proxy == "http://Tim:secret@proxy.example.com:1337"
+
+    assert web.post("/api/proxy", json={"proxy": None}).json() == {"ok": True, "active": None, "exit_ip": None}
+    assert dash._steam.proxy is None and dash.target_rate == 5.0
+
+
+def test_env_proxy_is_fallback(tmp_path):
+    s = Settings(app_key="k", mode="dry", data_dir=tmp_path, steam_proxy="socks5://env.example.com:1080")
+    sweeper = Sweeper(s, [CASE], FakeClient(), Store(tmp_path / "t.sqlite"), clock=Clock())
+    dash = Dashboard(s, sweeper, tmp_path / "t.sqlite", LogBuffer())
+    assert dash.proxy_source == "env" and dash._steam.proxy == "socks5://env.example.com:1080"
+    assert dash.set_proxy(None) is None and dash._steam.proxy == "socks5://env.example.com:1080"
 
 
 def test_target_rate_loaded_at_start_and_waits_for_steam(tmp_path):

@@ -246,6 +246,15 @@
       form.hidden = false; guard.hidden = true; logout.hidden = true;
     }
     if (!sl.pending && pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+    renderProxy();
+  }
+
+  function renderProxy() {
+    const p = state.proxy || {};
+    $("#proxy-clear").hidden = p.source !== "dashboard";
+    $("#proxy-status").textContent = p.active
+      ? `当前：${p.active}（${p.source === "dashboard" ? "看板设置" : ".env 配置"}）${p.exit_ip ? `，出口 IP ${p.exit_ip}` : ""}`
+      : "未配置，直连 Steam";
   }
 
   function renderPurchases() {
@@ -308,6 +317,17 @@
     post("/api/steam/guard", { code });
   });
   $("#steam-cancel").addEventListener("click", () => post("/api/steam/login/cancel"));
+  $("#proxy-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const proxy = $("#proxy-input").value.trim();
+    if (!proxy) { alert("先填代理地址，比如 http://用户名:密码@地址:端口"); return; }
+    $("#proxy-status").textContent = "正在通过代理测试…";
+    const j = await post("/api/proxy", { proxy });
+    if (j && j.ok) $("#proxy-input").value = "";
+  });
+  $("#proxy-clear").addEventListener("click", () => {
+    if (confirm("清除看板上设置的 Steam 代理？之后回退到 .env 里的配置（没有就直连）。")) post("/api/proxy", { proxy: null });
+  });
   $("#steam-logout").addEventListener("click", () => {
     if (confirm("退出 Steam 登录？之后挂单价按当前最低价算。")) post("/api/steam/logout");
   });
