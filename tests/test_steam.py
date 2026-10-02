@@ -88,6 +88,35 @@ def test_proxy_shortens_interval_and_backoff():
     assert direct.proxy is None and direct._http.proxies == {} and direct._interval == MIN_INTERVAL
 
 
+def test_proxy_retries_429_with_new_exit_before_blocking(monkeypatch):
+    m = SteamMarket(proxy="http://u:p@proxy.example.com:1337")
+    assert m._http.headers["Connection"] == "close"   # 每个请求新建连接，轮转代理才会换出口
+    monkeypatch.setattr(m, "_throttle", lambda: None)
+    codes = iter([429, 429, 200, 429, 429, 429])
+    calls = []
+
+    class Resp:
+        def __init__(self, code):
+            self.status_code = code
+
+        def json(self):
+            return {"success": True, "lowest_price": "$0.16", "median_price": "$0.16", "volume": "1"}
+
+    def fake_get(url, *, timeout, params):
+        calls.append(url)
+        return Resp(next(codes))
+    monkeypatch.setattr(m._http, "get", fake_get)
+    # 两次 429 后第三次成功：不退避
+    assert m.price(730, "Kilowatt Case").lowest == 0.16
+    assert len(calls) == 3 and m.blocked_for == 0
+    # 三次都 429 才退避（代理模式 30 秒）
+    with pytest.raises(SteamError, match="限流"):
+        m.price(730, "Kilowatt Case")
+    assert len(calls) == 6 and m.blocked_for == pytest.approx(BLOCK_SEC_PROXY)
+    m.set_proxy(None)
+    assert "Connection" not in m._http.headers
+
+
 def test_proxy_url_check_and_mask():
     assert check_proxy_url("  http://u:p@proxy.example.com:1337 ") == "http://u:p@proxy.example.com:1337"
     assert check_proxy_url("socks5://proxy.example.com:1080") == "socks5://proxy.example.com:1080"

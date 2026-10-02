@@ -1,6 +1,7 @@
 """Steam 社区市场价格，以及“C5 买、Steam 卖”能拿到几折余额的换算。"""
 from __future__ import annotations
 
+import logging
 import re
 import time
 from dataclasses import dataclass
@@ -10,6 +11,8 @@ from urllib.parse import urlsplit
 import requests
 
 from . import __version__
+
+log = logging.getLogger(__name__)
 
 PRICE_OVERVIEW = "https://steamcommunity.com/market/priceoverview/"
 # 实测 Steam 对 "Mozilla/..." 和 "python-requests/..." 这类 UA 直接回 429（不看 IP），老老实实报自己的名字反而放行
@@ -23,6 +26,7 @@ MIN_INTERVAL_PROXY = 1.0  # 走轮转代理时每个请求换出口 IP，按 IP 
 BLOCK_SEC = 300.0       # 被 429 后多久内不再请求 Steam；连续被限流退避翻倍
 BLOCK_SEC_PROXY = 30.0  # 轮转代理下 429 只是某个出口 IP 被限，退避短一点
 BLOCK_MAX_SEC = 3600.0
+PROXY_RETRIES = 3       # 走轮转代理时 429 换一个出口 IP 再试，最多几次
 
 
 class SteamError(Exception):
@@ -196,6 +200,11 @@ class SteamMarket:
         self.proxy = proxy or None
         for s in (self._http, self._auth_http):
             s.proxies = {"http": proxy, "https": proxy} if proxy else {}
+            # 轮转代理按“新连接换出口 IP”：长连接复用会让一整轮请求都走同一个出口，所以走代理时每个请求都新建连接
+            if proxy:
+                s.headers["Connection"] = "close"
+            else:
+                s.headers.pop("Connection", None)
         self._interval = MIN_INTERVAL_PROXY if proxy else MIN_INTERVAL
         self._block_base = BLOCK_SEC_PROXY if proxy else BLOCK_SEC
         self._block_sec = self._block_base  # 下次被限流退避多久，连续被限流翻倍
@@ -222,18 +231,22 @@ class SteamMarket:
         wait = self.blocked_for
         if wait > 0:
             raise SteamError(f"Steam 限流中，{fmt_wait(wait)}后再试")
-        self._throttle()
-        try:
-            resp = (http or self._http).get(url, timeout=self._timeout, params=params)
-        except requests.RequestException as e:
-            raise SteamError(f"Steam 网络错误: {type(e).__name__}") from None
-        if resp.status_code in (429, 403):
-            block = self._block_sec
-            self._blocked_until = self._now() + block
-            self._block_sec = min(block * 2, BLOCK_MAX_SEC)
-            raise SteamError(f"Steam 限流（{resp.status_code}），{fmt_wait(block)}内不再请求 Steam")
-        self._block_sec = self._block_base  # 正常拿到响应就把退避复位
-        return resp
+        attempts = PROXY_RETRIES if self.proxy else 1   # 轮转代理：429 多半只是这个出口 IP 被限，换一个再试
+        for attempt in range(1, attempts + 1):
+            self._throttle()
+            try:
+                resp = (http or self._http).get(url, timeout=self._timeout, params=params)
+            except requests.RequestException as e:
+                raise SteamError(f"Steam 网络错误: {type(e).__name__}") from None
+            if resp.status_code not in (429, 403):
+                self._block_sec = self._block_base  # 正常拿到响应就把退避复位
+                return resp
+            if attempt < attempts:
+                log.info("Steam %s，换一个代理出口重试（%d/%d）", resp.status_code, attempt, attempts)
+        block = self._block_sec
+        self._blocked_until = self._now() + block
+        self._block_sec = min(block * 2, BLOCK_MAX_SEC)
+        raise SteamError(f"Steam 限流（{resp.status_code}），{fmt_wait(block)}内不再请求 Steam")
 
     def price(self, app_id: int, name: str, *, currency: int | None = None) -> SteamPrice:
         """当前最低挂单价等。currency 不传用初始化时的币种（默认人民币），传 USD 查美元价。"""
