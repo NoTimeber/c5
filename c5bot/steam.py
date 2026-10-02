@@ -8,13 +8,19 @@ from datetime import datetime, timezone
 
 import requests
 
+from . import __version__
+
 PRICE_OVERVIEW = "https://steamcommunity.com/market/priceoverview/"
+# 实测 Steam 对 "Mozilla/..." 和 "python-requests/..." 这类 UA 直接回 429（不看 IP），老老实实报自己的名字反而放行
+USER_AGENT = f"c5bot/{__version__} (+https://github.com/NoTimeber/c5)"
 PRICE_HISTORY = "https://steamcommunity.com/market/pricehistory/"   # 要登录；币种跟登录账号的钱包走
 USD = 1                 # Steam 币种编号：1 美元，23 人民币
 STEAM_FEE_PCT = 5       # Steam 交易手续费 5%
 GAME_FEE_PCT = 10       # CS2 游戏手续费 10%
 MIN_INTERVAL = 3.0      # 未登录状态大约每分钟 20 次，再快就 429
+MIN_INTERVAL_PROXY = 1.0  # 走轮转代理时每个请求换出口 IP，按 IP 的限流不再是瓶颈
 BLOCK_SEC = 300.0       # 被 429 后多久内不再请求 Steam；连续被限流退避翻倍
+BLOCK_SEC_PROXY = 30.0  # 轮转代理下 429 只是某个出口 IP 被限，退避短一点
 BLOCK_MAX_SEC = 3600.0
 
 
@@ -38,6 +44,16 @@ class HistoryPoint:
     ts: float       # UTC 时间戳；最近一个月按小时，更早按天
     price: float    # 这一小时成交的中位价，币种是登录账号的钱包币种
     volume: int
+
+
+@dataclass(frozen=True)
+class PriceHistory:
+    points: list[HistoryPoint]
+    prefix: str = ""    # 价格前缀，"$" 美元、"¥ " 人民币：币种跟登录账号的钱包区走，不跟查询参数
+
+    @property
+    def usd(self) -> bool:
+        return self.prefix.strip() == "$"
 
 
 @dataclass(frozen=True)
@@ -100,19 +116,29 @@ def fmt_wait(sec: float) -> str:
 class SteamMarket:
     def __init__(self, *, proxy: str | None = None, currency: int = 23, timeout: float = 10.0,
                  clock=time.monotonic):
-        self._http = requests.Session()
-        self._http.headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) c5bot"
-        # 实测 Accept-Encoding 里只要有 br，Steam 就直接回 429；requests 装了 brotli 后默认会带上
-        self._http.headers["Accept-Encoding"] = "gzip, deflate"
-        if proxy:
-            self._http.proxies = {"http": proxy, "https": proxy}
+        # 两个会话：行情用匿名的，成交历史用带登录 cookie 的。登录 cookie 只发给必须登录的接口，
+        # 实测带着 cookie 查行情会被 Steam 按账号限流，匿名反而没事
+        self._http = self._session(proxy)
+        self._auth_http = self._session(proxy)
         self._currency = currency
         self._timeout = timeout
         self._now = clock
         self._last = 0.0
+        self._interval = MIN_INTERVAL_PROXY if proxy else MIN_INTERVAL
         self._blocked_until = 0.0       # 被限流后这个时间之前不再请求
-        self._block_sec = BLOCK_SEC     # 下次被限流退避多久，连续被限流翻倍
+        self._block_base = BLOCK_SEC_PROXY if proxy else BLOCK_SEC
+        self._block_sec = self._block_base  # 下次被限流退避多久，连续被限流翻倍
         self.logged_in = False
+
+    @staticmethod
+    def _session(proxy: str | None) -> requests.Session:
+        s = requests.Session()
+        s.headers["User-Agent"] = USER_AGENT
+        # 实测 Accept-Encoding 里只要有 br，Steam 就直接回 429；requests 装了 brotli 后默认会带上
+        s.headers["Accept-Encoding"] = "gzip, deflate"
+        if proxy:
+            s.proxies = {"http": proxy, "https": proxy}
+        return s
 
     @property
     def blocked_for(self) -> float:
@@ -120,16 +146,16 @@ class SteamMarket:
         return max(0.0, self._blocked_until - self._now())
 
     def set_login(self, cookie: str | None) -> None:
-        """设置 / 清除 steamLoginSecure（看板登录后由 Dashboard 调用）。"""
+        """设置 / 清除 steamLoginSecure（看板登录后由 Dashboard 调用）。只给成交历史那个会话用。"""
         try:
-            self._http.cookies.clear(domain="steamcommunity.com", path="/", name="steamLoginSecure")
+            self._auth_http.cookies.clear(domain="steamcommunity.com", path="/", name="steamLoginSecure")
         except KeyError:
             pass
         if cookie:
-            self._http.cookies.set("steamLoginSecure", cookie, domain="steamcommunity.com", path="/")
+            self._auth_http.cookies.set("steamLoginSecure", cookie, domain="steamcommunity.com", path="/")
         self.logged_in = bool(cookie)
 
-    def _get(self, url: str, params: dict) -> requests.Response:
+    def _get(self, url: str, params: dict, *, http: requests.Session | None = None) -> requests.Response:
         """带限流退避的 GET。被 Steam 限流（429 / 403）后 BLOCK_SEC 内直接抛 SteamError、不发请求；
         连续被限流退避时间翻倍。被限流后继续请求只会把封锁拖长，所以不做逐个重试。"""
         wait = self.blocked_for
@@ -137,7 +163,7 @@ class SteamMarket:
             raise SteamError(f"Steam 限流中，{fmt_wait(wait)}后再试")
         self._throttle()
         try:
-            resp = self._http.get(url, timeout=self._timeout, params=params)
+            resp = (http or self._http).get(url, timeout=self._timeout, params=params)
         except requests.RequestException as e:
             raise SteamError(f"Steam 网络错误: {type(e).__name__}") from None
         if resp.status_code in (429, 403):
@@ -145,7 +171,7 @@ class SteamMarket:
             self._blocked_until = self._now() + block
             self._block_sec = min(block * 2, BLOCK_MAX_SEC)
             raise SteamError(f"Steam 限流（{resp.status_code}），{fmt_wait(block)}内不再请求 Steam")
-        self._block_sec = BLOCK_SEC  # 正常拿到响应就把退避复位
+        self._block_sec = self._block_base  # 正常拿到响应就把退避复位
         return resp
 
     def price(self, app_id: int, name: str, *, currency: int | None = None) -> SteamPrice:
@@ -164,11 +190,11 @@ class SteamMarket:
                           median=parse_money(data.get("median_price")),
                           volume=int(volume) if volume else None)
 
-    def price_history(self, app_id: int, name: str) -> list[HistoryPoint]:
+    def price_history(self, app_id: int, name: str) -> PriceHistory:
         """成交历史（市场页那张图的数据）。要登录；没登录或登录态失效时 Steam 回 400 + 空数组。"""
         if not self.logged_in:
             raise SteamLoginRequired("查成交历史要先在看板上登录 Steam")
-        resp = self._get(PRICE_HISTORY, {"appid": app_id, "market_hash_name": name})
+        resp = self._get(PRICE_HISTORY, {"appid": app_id, "market_hash_name": name}, http=self._auth_http)
         try:
             data = resp.json()
         except ValueError:
@@ -184,10 +210,10 @@ class SteamMarket:
                 points.append(HistoryPoint(parse_history_time(str(when)), float(price), int(float(volume))))
             except (ValueError, TypeError):
                 continue
-        return points
+        return PriceHistory(points, str(data.get("price_prefix") or ""))
 
     def _throttle(self) -> None:
-        wait = self._last + MIN_INTERVAL - self._now()
+        wait = self._last + self._interval - self._now()
         if wait > 0:
             time.sleep(wait)
         self._last = self._now()

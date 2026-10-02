@@ -120,7 +120,7 @@ wheels = [
 
 [[package]]
 name = "c5-case-sweeper"
-version = "0.3.0"
+version = "0.3.1"
 source = { virtual = "." }
 dependencies = [
     { name = "backports-zstd", marker = "python_full_version < '3.14'" },

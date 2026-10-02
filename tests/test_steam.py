@@ -4,6 +4,9 @@ import pytest
 
 from c5bot.steam import (
     BLOCK_SEC,
+    BLOCK_SEC_PROXY,
+    MIN_INTERVAL,
+    MIN_INTERVAL_PROXY,
     USD,
     HistoryPoint,
     SteamError,
@@ -66,6 +69,14 @@ def test_price_currency_override(monkeypatch):
     assert m.price(730, "Kilowatt Case").lowest == 1.40
     assert m.price(730, "Kilowatt Case", currency=USD).lowest == 1.40
     assert seen == [23, USD]
+
+
+def test_proxy_shortens_interval_and_backoff():
+    direct, via = SteamMarket(), SteamMarket(proxy="http://u:p@proxy.example.com:1337")
+    assert (direct._interval, direct._block_sec) == (MIN_INTERVAL, BLOCK_SEC)
+    assert (via._interval, via._block_sec) == (MIN_INTERVAL_PROXY, BLOCK_SEC_PROXY)
+    assert via._http.proxies == {"http": "http://u:p@proxy.example.com:1337", "https": "http://u:p@proxy.example.com:1337"}
+    assert via._auth_http.proxies == via._http.proxies
 
 
 def test_fmt_wait():
@@ -146,19 +157,25 @@ def test_price_history_requires_login_and_parses(monkeypatch):
 
     replies = iter([Resp(200, {"success": True, "price_prefix": "¥ ", "prices": [
         ["Oct 01 2026 01: +0", 1.08, "3514"], ["Oct 01 2026 02: +0", "1.1", "12"], ["bad", 1, 1]]}),
+        Resp(200, {"success": True, "price_prefix": "$", "prices": [["Oct 01 2026 01: +0", 0.18, "900"]]}),
         Resp(400, [])])
 
     def fake_get(url, *, timeout, params):
-        seen["cookie"] = m._http.cookies.get("steamLoginSecure", domain="steamcommunity.com")
+        seen["cookie"] = m._auth_http.cookies.get("steamLoginSecure", domain="steamcommunity.com")
         seen["params"] = params
         return next(replies)
-    monkeypatch.setattr(m._http, "get", fake_get)
+    monkeypatch.setattr(m._auth_http, "get", fake_get)
     m.set_login("7656%7C%7Ctoken")
-    pts = m.price_history(730, "Kilowatt Case")
+    hist = m.price_history(730, "Kilowatt Case")
     assert seen["cookie"] == "7656%7C%7Ctoken" and seen["params"]["market_hash_name"] == "Kilowatt Case"
-    assert [(p.price, p.volume) for p in pts] == [(1.08, 3514), (1.1, 12)]
+    assert [(p.price, p.volume) for p in hist.points] == [(1.08, 3514), (1.1, 12)]
+    assert hist.prefix == "¥ " and not hist.usd
+    # 美元区账号：前缀是 $
+    assert m.price_history(730, "Kilowatt Case").usd
+    # 行情那个会话始终不带登录 cookie
+    assert m._http.cookies.get("steamLoginSecure", domain="steamcommunity.com") is None
     # 登录态失效：Steam 回 400 + []
     with pytest.raises(SteamLoginRequired, match="失效"):
         m.price_history(730, "Kilowatt Case")
     m.set_login(None)
-    assert m._http.cookies.get("steamLoginSecure", domain="steamcommunity.com") is None and not m.logged_in
+    assert m._auth_http.cookies.get("steamLoginSecure", domain="steamcommunity.com") is None and not m.logged_in

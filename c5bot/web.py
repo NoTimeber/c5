@@ -34,7 +34,7 @@ from .compare import (
     target_price,
 )
 from .config import ROOT, Settings, load_watchlist
-from .steam import SteamError, SteamLoginRequired, SteamMarket, fmt_wait, sell_price_from_history
+from .steam import USD, SteamError, SteamLoginRequired, SteamMarket, fmt_wait, sell_price_from_history
 from .steam_login import GUARD_NAMES, SteamAuth, SteamLoginError, SteamSession, load_session, renew, save_session
 from .store import Store
 from .sweeper import Sweeper
@@ -128,7 +128,11 @@ class Dashboard:
         try:
             items = list(self.sweeper.items)
             use_history = self._ensure_session()
+            self._refresh_rate()  # 先量汇率：美元区账号的成交历史要靠它换算成人民币
             fresh: list[tuple] = []
+            if self._steam.blocked_for > 0:
+                log.warning("Steam 限流，本轮饰品行情先跳过，沿用上次的价")
+                items = []
             for it in items:
                 if self._stop.is_set():
                     return
@@ -149,7 +153,6 @@ class Dashboard:
                     if self._steam.blocked_for > 0:
                         log.warning("Steam 限流，本轮剩下的饰品先跳过，沿用上次的价")
                         break
-            self._refresh_rate()
             self.steam_at = time.time()
             self._apply_targets()
             stats = self.sweeper.view.get("stats") or {}
@@ -163,9 +166,9 @@ class Dashboard:
 
     def _refresh_history(self, it, sp) -> bool:
         """拉一个饰品的成交历史，算挂单价。返回登录态还能不能继续用。"""
-        old = self.history.get(it.name) or {"sell": None, "volume": None, "sell_at": None, "at": None}
+        old = self.history.get(it.name) or {"sell": None, "sell_usd": None, "volume": None, "sell_at": None, "at": None}
         try:
-            points = self._steam.price_history(it.app_id, it.name)
+            hist = self._steam.price_history(it.app_id, it.name)
         except SteamLoginRequired as e:
             self.history[it.name] = {**old, "error": str(e)}
             log.warning("Steam 成交历史 %s: %s", it.name, e)
@@ -174,16 +177,25 @@ class Dashboard:
             self.history[it.name] = {**old, "error": str(e)}
             log.warning("Steam 成交历史 %s: %s", it.name, e)
             return True
-        sell = sell_price_from_history(points, self.s.steam_sell_window_days)
+        sell = sell_price_from_history(hist.points, self.s.steam_sell_window_days)
         if sell is None:
             self.history[it.name] = {**old, "error": f"最近 {self.s.steam_sell_window_days:g} 天没有成交记录"}
             return True
-        # 历史价和当前中位价差太多，多半是登录账号的钱包币种和 STEAM_CURRENCY 不一致，这种价不能用
-        if sp.median and not 0.5 <= sell.price / sp.median <= 3:
+        price, sell_usd = sell.price, None
+        if hist.usd and self.s.steam_currency != USD:
+            # 登录的是美元区账号：成交历史是美元价，按 Steam 自己的换算率折成人民币
+            if not self.steam_rate:
+                self.history[it.name] = {**old, "error": "成交历史是美元价，等拿到 Steam 汇率后换算"}
+                return True
+            sell_usd = sell.price
+            price = round(sell.price * self.steam_rate.rate, 2)
+        # 换算后仍和当前中位价差太多，多半是钱包币种对不上（既不是人民币也不是美元），这种价不能用
+        if sp.median and not 0.5 <= price / sp.median <= 3:
             self.history[it.name] = {**old, "error": "成交历史的币种和 STEAM_CURRENCY 对不上，检查登录账号的钱包区"}
-            log.warning("Steam 成交历史 %s: 历史价 %.2f 和当前中位价 %.2f 对不上，疑似币种不一致", it.name, sell.price, sp.median)
+            log.warning("Steam 成交历史 %s: 历史价 %.2f 和当前中位价 %.2f 对不上，疑似币种不一致", it.name, price, sp.median)
             return True
-        self.history[it.name] = {"sell": sell.price, "volume": sell.volume, "sell_at": sell.ts, "at": time.time(), "error": None}
+        self.history[it.name] = {"sell": price, "sell_usd": sell_usd, "volume": sell.volume, "sell_at": sell.ts,
+                                 "at": time.time(), "error": None}
         return True
 
     def _refresh_rate(self) -> None:
@@ -215,9 +227,12 @@ class Dashboard:
         """被 Steam 限流时还要等多少秒，0 = 正常。"""
         return self._steam.blocked_for
 
+    # 登录和续期直连 Steam，不走 STEAM_PROXY：登录是多步流程，轮转代理每步换一个 IP 容易被 Steam 判成异常；
+    # 拿到的令牌本身不绑 IP，之后行情、成交历史走代理没问题。
+
     def steam_login_begin(self, account: str, password: str) -> dict:
         """提交账号密码。返回 {logged_in, guard}；guard 非空表示还要验证码或手机确认。"""
-        auth = SteamAuth(proxy=self.s.steam_proxy, timeout=self.s.timeout)
+        auth = SteamAuth(timeout=self.s.timeout)
         guards = auth.begin(account, password)
         self._auth = auth
         self.steam_login_error = None
@@ -241,7 +256,7 @@ class Dashboard:
         if sess is None:
             return False
         if not sess.access_token:
-            sess = renew(sess, proxy=self.s.steam_proxy, timeout=self.s.timeout)
+            sess = renew(sess, timeout=self.s.timeout)
         self._auth = None
         self._set_session(sess)
         log.info("Steam 已登录：%s，挂单价改按最近 %g 天成交历史算", sess.account, self.s.steam_sell_window_days)
@@ -278,7 +293,7 @@ class Dashboard:
         if sess.access_exp - now > ACCESS_RENEW_BEFORE_SEC:
             return True
         try:
-            self._set_session(renew(sess, proxy=self.s.steam_proxy, timeout=self.s.timeout))
+            self._set_session(renew(sess, timeout=self.s.timeout))
             log.info("Steam 登录态已续期（%s）", sess.account)
             return True
         except SteamLoginError as e:
@@ -291,7 +306,7 @@ class Dashboard:
         sess = self.steam_session
         if sess:
             try:
-                self._set_session(renew(sess, proxy=self.s.steam_proxy, timeout=self.s.timeout))
+                self._set_session(renew(sess, timeout=self.s.timeout))
                 log.info("Steam 登录态已续期（%s）", sess.account)
                 return True
             except SteamLoginError as e:
@@ -405,7 +420,7 @@ class Dashboard:
                 "status": status, "pause_until": pause_until.get(it.name),
                 "sell_count": st.get("sellCount"), "purchase_max": st.get("purchaseMaxPrice"),
                 "max_price": it.max_price, "target_auto": auto,
-                "sell_src": src, "sell_volume": h.get("volume"), "sell_at": h.get("sell_at"),
+                "sell_src": src, "sell_volume": h.get("volume"), "sell_at": h.get("sell_at"), "sell_usd": h.get("sell_usd"),
                 "history_error": h.get("error"),
                 "max_qty": it.max_qty, "max_spend": it.max_spend, "bought": qty, "spent": spent,
                 "steam_at": steam.get("at"), "steam_error": steam.get("error"),

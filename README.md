@@ -74,7 +74,7 @@ uv run python -m c5bot compare --every 30           # 每 30 分钟重算一次�
 
 - 登录走 Steam 官方的网页登录接口：输入账号、密码，再输手机令牌 / 邮箱验证码，或直接在手机 Steam App 上点确认。密码只用来向 Steam 换登录令牌，不保存、不进日志。
 - 拿到的刷新令牌存在 `data/steam_session.json`（权限 600），访问令牌一天一换，脚本自动续，几个月内不用再登录；过期后看板会提示重新登录。这个文件等于登录态，别外传。
-- 查成交历史不需要是收货账号，用一个没有库存和余额的小号最稳妥。成交历史的币种跟登录账号的钱包区走，要和 `STEAM_CURRENCY` 一致，不一致时看板会标出来并退回按最低价算。
+- 查成交历史不需要是收货账号，用一个没有库存和余额的小号最稳妥。成交历史的币种跟登录账号的钱包区走：人民币区直接用；美元区按 Steam 汇率换算成人民币再用（看板会标出原始美元价，美元只到分，换算后精度略低）；其它币种退回按最低价算并标出来。
 - 历史拉不到（限流、登录态失效）时退回按最低价算，只会让目标价偏低少买，不会多付。
 - 看板没有登录保护，所以这个功能更要求看板只监听 127.0.0.1、远程只走 SSH 隧道。
 
@@ -187,7 +187,7 @@ docker run -d --name watchtower --restart unless-stopped \
 - 服务器在国内拉不动 `ghcr.io` 的话，改推阿里云容器镜像服务（个人版免费）：在 GitHub 仓库 Settings → Secrets and variables → Actions 设 Variables `C5_REGISTRY`、`C5_IMAGE` 和 Secrets `C5_REGISTRY_USER`、`C5_REGISTRY_PASSWORD`；服务器安装时传 `C5BOT_IMAGE=<阿里云镜像名>` 和阿里云账号的 `GHCR_USER` / `GHCR_TOKEN`（变量名沿用，登录的是镜像名里的那个注册表）。
 - `compose.yaml` 由脚本管理，每次 `upgrade` 覆盖，别在服务器上手改；所有自定义都放 `.env`。改 `watchlist.toml` 不用重启，看板上点“重载 watchlist”；改 `.env` 跑 `restart`。
 - 只看行情不买：`.env` 里 `C5_START_PAUSED=yes`，在看板上点“继续扫货”才开始买。
-- Steam 市场接口对匿名请求限流严，云服务器的 IP 更容易被 429。被限流后看板 5 分钟内不再请求 Steam（连续被限翻倍到最多 1 小时），期间沿用旧价，“Steam 价”卡片会显示限流中并自动重试；Steam 汇率每小时才重新量一次，手动“刷新 Steam 价”至少间隔 1 分钟。频繁被限流就配 `STEAM_PROXY` 换一个出口 IP，或调大 `STEAM_REFRESH_SEC`。
+- Steam 市场接口对匿名请求限流严，云服务器的 IP 更容易被 429。被限流后看板 5 分钟内不再请求 Steam（连续被限翻倍到最多 1 小时），期间沿用旧价，“Steam 价”卡片会显示限流中并自动重试；Steam 汇率每小时才重新量一次，手动“刷新 Steam 价”至少间隔 1 分钟。频繁被限流就配 `STEAM_PROXY`，推荐轮转住宅代理（`http://用户名:密码@代理地址:端口`，每个请求换出口 IP，退避时间也会自动缩短到 30 秒），或调大 `STEAM_REFRESH_SEC`。看板上登录 Steam 和续期不走这个代理。
 - `docker stop` 发 SIGTERM，程序按 Ctrl+C 同样的路径退出；正在发的下单请求最坏也就是记成“结果未知”，下次启动自动对账。
 - 不经过 CI 在本机 build：`docker compose -f compose.yaml -f compose.build.yaml up -d --build`。
 - 本机没装 Docker 也没有 bash，Dockerfile、workflow、install.sh 都没有实际跑过；第一次失败的话把输出贴出来。

@@ -167,7 +167,7 @@
       const spendCap = i.max_spend ? ` / ${num(i.max_spend)}` : "";
       const targetSub = i.target_auto ? `<div class="sub-cell">${i.c5_target == null ? "等 Steam 价" : "按汇率"}</div>` : "";
       let sellSub;
-      if (i.sell_src === "history") sellSub = `<div class="sub-cell" title="最近 ${s.sell_window_days} 天成交历史里最高的小时中位价，${fmtTime(i.sell_at, true)} 那小时成交 ${int(i.sell_volume)} 件">${s.sell_window_days} 天最高 · ${int(i.sell_volume)} 件</div>`;
+      if (i.sell_src === "history") sellSub = `<div class="sub-cell" title="最近 ${s.sell_window_days} 天成交历史里最高的小时中位价，${fmtTime(i.sell_at, true)} 那小时成交 ${int(i.sell_volume)} 件${i.sell_usd != null ? `。登录账号是美元区，$${num(i.sell_usd)} 按 Steam 汇率换算` : ""}">${s.sell_window_days} 天最高${i.sell_usd != null ? ` $${num(i.sell_usd)}` : ""} · ${int(i.sell_volume)} 件</div>`;
       else if (i.history_error) sellSub = `<div class="sub-cell down" title="${esc(i.history_error)}">按最低价（历史失败）</div>`;
       else sellSub = `<div class="sub-cell">按最低价</div>`;
       return `<tr>

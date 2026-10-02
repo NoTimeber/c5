@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 from c5bot import __version__
 from c5bot.compare import SteamRate
 from c5bot.config import Settings, WatchItem
-from c5bot.steam import USD, HistoryPoint, SteamError, SteamLoginRequired, SteamPrice
+from c5bot.steam import USD, HistoryPoint, PriceHistory, SteamError, SteamLoginRequired, SteamPrice
 from c5bot.steam_login import SteamLoginError, SteamSession
 from c5bot.store import Store
 from c5bot.sweeper import Sweeper
@@ -163,7 +163,7 @@ def test_refresh_steam_fetches_rate_and_applies_targets(env, monkeypatch):
     monkeypatch.setattr(dash._steam, "price", fake_price)
     dash.set_target_rate(5.0)
     dash.refresh_steam()
-    assert calls == [(CASE.name, None), (OTHER.name, None), (ref, None), (ref, USD)]
+    assert calls == [(ref, None), (ref, USD), (CASE.name, None), (OTHER.name, None)]  # 先量汇率，再查箱子
     assert dash.steam_rate.rate == pytest.approx(243.00 / 36.05) and dash.steam_rate.name == ref
     disc = 5.0 / (243.00 / 36.05)
     assert sweeper.auto_targets == {
@@ -206,17 +206,18 @@ def test_refresh_stops_hammering_steam_when_rate_limited(env, monkeypatch):
     monkeypatch.setattr(dash._steam._http, "get", fake_get)
     monkeypatch.setattr(dash._steam, "_throttle", lambda: None)
     dash.refresh_steam()
-    # 第一个饰品被 429 后，剩下的饰品和汇率都不再请求
-    assert gets == [CASE.name]
+    # 第一个请求（量汇率）被 429 后，饰品行情和成交历史都不再请求
+    assert gets == [dash.s.steam_rate_item]
     st = web.get("/api/state").json()
     assert 0 < st["steam"]["blocked_for"] <= 300
-    assert "429" in st["items"][0]["steam_error"] and st["items"][1]["steam_error"] is None
+    assert "429" in st["rate"]["steam_error"]
+    assert st["items"][0]["steam_error"] is None and st["items"][1]["steam_error"] is None
     assert dash.steam_rate is None
     r = web.post("/api/steam/refresh")
     assert r.status_code == 429 and "限流" in r.json()["error"]
     # 退避期内再刷新也不发请求
     dash.refresh_steam()
-    assert gets == [CASE.name]
+    assert gets == [dash.s.steam_rate_item]
 
 
 def test_manual_refresh_throttled(env):
@@ -299,9 +300,9 @@ def test_refresh_uses_history_sell_price_when_logged_in(env, monkeypatch):
     now = time.time()
     prices = {CASE.name: SteamPrice(1.17, 1.15, 80000), OTHER.name: SteamPrice(1.67, 1.67, 101052),
               dash.s.steam_rate_item: SteamPrice(243.0, 250.0, 93)}
-    history = {CASE.name: [HistoryPoint(now - 86400, 1.30, 500), HistoryPoint(now - 3600, 1.17, 3000),
-                           HistoryPoint(now - 10 * 86400, 2.00, 100)],
-               OTHER.name: [HistoryPoint(now - 3600, 9.00, 10)]}   # 和当前中位价 1.67 差太多：疑似币种不对
+    history = {CASE.name: PriceHistory([HistoryPoint(now - 86400, 1.30, 500), HistoryPoint(now - 3600, 1.17, 3000),
+                                        HistoryPoint(now - 10 * 86400, 2.00, 100)], "¥ "),
+               OTHER.name: PriceHistory([HistoryPoint(now - 3600, 9.00, 10)], "¥ ")}   # 和当前中位价 1.67 差太多：疑似币种不对
     calls = []
 
     def fake_price(app_id, name, *, currency=None):
@@ -334,6 +335,13 @@ def test_refresh_uses_history_sell_price_when_logged_in(env, monkeypatch):
     assert rev["sell_src"] == "lowest" and "币种" in rev["history_error"]
     assert sweeper.auto_targets[OTHER.name] == int(1.46 * disc * 100 + 1e-9) / 100
 
+    # 美元区账号：历史是美元价，按 Steam 汇率换算成人民币（0.19 × 6.74 = 1.28）
+    history[CASE.name] = PriceHistory([HistoryPoint(now - 3600, 0.19, 900)], "$")
+    dash.refresh_steam()
+    kilo = web.get("/api/state").json()["items"][0]
+    rate = 243.0 / 36.05
+    assert kilo["sell_src"] == "history" and kilo["steam_sell"] == round(0.19 * rate, 2) and kilo["sell_usd"] == 0.19
+
     # 退出登录：回到最低价
     web.post("/api/steam/logout")
     assert web.get("/api/state").json()["items"][0]["sell_src"] == "lowest"
@@ -346,10 +354,10 @@ def test_access_token_renewed_before_expiry(env, monkeypatch):
     renewed = session(access_exp=time.time() + 86400)
     monkeypatch.setattr("c5bot.web.renew", lambda sess, **kw: renewed)
     monkeypatch.setattr(dash._steam, "price", lambda app_id, name, **kw: SteamPrice(1.17, 1.15, 1))
-    monkeypatch.setattr(dash._steam, "price_history", lambda app_id, name: [])
+    monkeypatch.setattr(dash._steam, "price_history", lambda app_id, name: PriceHistory([]))
     dash.refresh_steam()
     assert dash.steam_session.access_token == renewed.access_token
-    assert dash._steam._http.cookies.get("steamLoginSecure", domain="steamcommunity.com") == renewed.cookie
+    assert dash._steam._auth_http.cookies.get("steamLoginSecure", domain="steamcommunity.com") == renewed.cookie
 
 
 def test_rejected_session_is_dropped_when_renew_fails(env, monkeypatch):
