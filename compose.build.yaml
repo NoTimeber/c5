@@ -1,0 +1,5 @@
+# 不经过 CI、在本机直接 build 时叠加这个文件：
+#   docker compose -f compose.yaml -f compose.build.yaml up -d --build
+services:
+  c5bot:
+    build: .

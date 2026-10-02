@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>C5 扫货看板</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="dot" id="conn-dot" aria-hidden="true"></span>
+    <h1>C5 扫货看板</h1>
+    <span id="mode-badge"></span>
+    <span class="pill" id="strategy">-</span>
+    <span id="run-badge"></span>
+  </div>
+  <div class="right">
+    <span class="muted" id="cycle-text">-</span>
+    <span class="muted" id="uptime">-</span>
+    <button class="ghost" id="theme-btn" type="button" title="切换深浅色">主题</button>
+  </div>
+</header>
+
+<main>
+  <div class="alert" id="error-box" hidden></div>
+
+  <section class="kpis" id="kpis" aria-label="汇总"></section>
+
+  <section class="card">
+    <div class="card-head">
+      <h2>监控 <span class="muted" id="items-sub"></span></h2>
+      <div class="actions">
+        <button class="ghost primary" id="btn-pause" type="button">暂停扫货</button>
+        <button class="ghost" id="btn-steam" type="button">刷新 Steam 价</button>
+        <button class="ghost" id="btn-reload" type="button" title="改了 watchlist.toml 之后点这里">重载 watchlist</button>
+        <button class="ghost" id="btn-orders" type="button" hidden>同步订单</button>
+      </div>
+    </div>
+    <div class="table-wrap" id="items"></div>
+  </section>
+
+  <div class="two-col">
+    <section class="card">
+      <div class="card-head"><h2>购买流水</h2><span class="muted" id="purchases-sub"></span></div>
+      <div class="table-wrap" id="purchases"></div>
+    </section>
+    <section class="card">
+      <div class="card-head"><h2>日志</h2><span class="muted" id="logs-sub"></span></div>
+      <div class="timeline" id="logs"></div>
+    </section>
+  </div>
+</main>
+
+<footer class="muted">
+  折 = C5 价 ÷ Steam 挂单价扣完手续费（Steam 5% + CS2 10%）的到手价，7.35折 表示 7.35 元换 10 元 Steam 余额。
+  C5 买到的饰品 7 天后才能挂 Steam 市场，折扣按当前 Steam 价算，仅供参考。
+</footer>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

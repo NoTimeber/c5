@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "c5",
+      "runtimeExecutable": "uv",
+      "runtimeArgs": ["run", "python", "-m", "c5bot", "run", "--paused"],
+      "port": 8766
+    }
+  ]
+}

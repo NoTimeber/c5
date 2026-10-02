@@ -1,0 +1,26 @@
+# 复制为 watchlist.toml 后填写。
+
+# 所有饰品的默认值，单个饰品里可以覆盖
+[defaults]
+app_id = 730        # 730 = CS2
+delivery = 0        # 0 不限 / 1 只要人工发货 / 2 只要自动发货
+asset_type = 1      # 1 普通在售 / 2 冷却期在售
+
+# 下面的 max_price 是按 2026-09-30 的 Steam 价按 7 折余额倒推的示例（Steam 最低价扣完手续费 × 0.7）。
+# 先跑 `uv run python -m c5bot compare` 看当天的价再定。
+
+[[items]]
+name = "Kilowatt Case"      # Steam 市场英文名（marketHashName），必须完全一致
+max_price = 0.70            # 单价不高于此值才买。Steam 1.17 -> 到手 1.02，0.70 约 6.9 折
+max_qty = 100               # 累计最多买多少个，重启不清零
+# max_spend = 60            # 这个箱子累计花费上限，不写 = 不限（仍受总预算约束）
+
+[[items]]
+name = "Revolution Case"
+max_price = 1.05            # Steam 1.73 -> 到手 1.51
+max_qty = 100
+
+[[items]]
+name = "Fracture Case"
+max_price = 2.50            # Steam 4.16 -> 到手 3.62
+max_qty = 50

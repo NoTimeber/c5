@@ -1,0 +1,19 @@
+services:
+  c5bot:
+    # 镜像由 GitHub Actions 构建推送，服务器只拉不 build。镜像名写在 .env 的 C5BOT_IMAGE 里
+    image: ${C5BOT_IMAGE:?在 .env 里写 C5BOT_IMAGE=ghcr.io/你的账号/c5bot:latest}
+    container_name: c5bot
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # 容器里要监听所有网卡；下面 ports 只映射到宿主机回环地址，外网访问不到
+      C5_UI_HOST: "0.0.0.0"
+      C5_DATA_DIR: /app/data
+      # POSIX 写法的北京时间，slim 镜像没有 tzdata 也能生效
+      TZ: CST-8
+    volumes:
+      - ./data:/app/data                        # sqlite 流水、日志、compare.csv
+      - ./watchlist.toml:/app/watchlist.toml:ro # 改了之后在看板点“重载 watchlist”即可，不用重启
+    ports:
+      - "127.0.0.1:8766:8766"
+    # 这个文件由 deploy/install.sh 管理，每次 upgrade 会覆盖；自定义都写在 .env（如 C5_START_PAUSED=yes 只看不买）
