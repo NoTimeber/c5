@@ -166,7 +166,8 @@ class Dashboard:
 
     def _refresh_history(self, it, sp) -> bool:
         """拉一个饰品的成交历史，算挂单价。返回登录态还能不能继续用。"""
-        old = self.history.get(it.name) or {"sell": None, "sell_usd": None, "volume": None, "sell_at": None, "at": None}
+        old = self.history.get(it.name) or {"sell": None, "sell_usd": None, "volume": None, "total": None,
+                                            "high": None, "share": None, "at": None}
         try:
             hist = self._steam.price_history(it.app_id, it.name)
         except SteamLoginRequired as e:
@@ -177,11 +178,11 @@ class Dashboard:
             self.history[it.name] = {**old, "error": str(e)}
             log.warning("Steam 成交历史 %s: %s", it.name, e)
             return True
-        sell = sell_price_from_history(hist.points, self.s.steam_sell_window_days)
+        sell = sell_price_from_history(hist.points, self.s.steam_sell_window_days, share=self.s.steam_sell_volume_share)
         if sell is None:
             self.history[it.name] = {**old, "error": f"最近 {self.s.steam_sell_window_days:g} 天没有成交记录"}
             return True
-        price, sell_usd = sell.price, None
+        price, high, sell_usd = sell.price, sell.high, None
         if hist.usd and self.s.steam_currency != USD:
             # 登录的是美元区账号：成交历史是美元价，按 Steam 自己的换算率折成人民币
             if not self.steam_rate:
@@ -189,13 +190,14 @@ class Dashboard:
                 return True
             sell_usd = sell.price
             price = round(sell.price * self.steam_rate.rate, 2)
+            high = round(sell.high * self.steam_rate.rate, 2)
         # 换算后仍和当前中位价差太多，多半是钱包币种对不上（既不是人民币也不是美元），这种价不能用
         if sp.median and not 0.5 <= price / sp.median <= 3:
             self.history[it.name] = {**old, "error": "成交历史的币种和 STEAM_CURRENCY 对不上，检查登录账号的钱包区"}
             log.warning("Steam 成交历史 %s: 历史价 %.2f 和当前中位价 %.2f 对不上，疑似币种不一致", it.name, price, sp.median)
             return True
-        self.history[it.name] = {"sell": price, "sell_usd": sell_usd, "volume": sell.volume, "sell_at": sell.ts,
-                                 "at": time.time(), "error": None}
+        self.history[it.name] = {"sell": price, "sell_usd": sell_usd, "volume": sell.volume, "total": sell.total,
+                                 "high": high, "share": sell.share, "at": time.time(), "error": None}
         return True
 
     @property
@@ -264,7 +266,8 @@ class Dashboard:
             sess = renew(sess, timeout=self.s.timeout)
         self._auth = None
         self._set_session(sess)
-        log.info("Steam 已登录：%s，挂单价改按最近 %g 天成交历史算", sess.account, self.s.steam_sell_window_days)
+        log.info("Steam 已登录：%s，挂单价改按最近 %g 天成交历史算（累计 %.0f%% 成交量的价）",
+                 sess.account, self.s.steam_sell_window_days, self.s.steam_sell_volume_share * 100)
         self.request_steam_refresh()
         return True
 
@@ -433,7 +436,8 @@ class Dashboard:
                 "status": status, "pause_until": pause_until.get(it.name),
                 "sell_count": st.get("sellCount"), "purchase_max": st.get("purchaseMaxPrice"),
                 "max_price": it.max_price, "target_auto": auto,
-                "sell_src": src, "sell_volume": h.get("volume"), "sell_at": h.get("sell_at"), "sell_usd": h.get("sell_usd"),
+                "sell_src": src, "sell_volume": h.get("volume"), "sell_total": h.get("total"),
+                "sell_high": h.get("high"), "sell_share": h.get("share"), "sell_usd": h.get("sell_usd"),
                 "history_error": h.get("error"),
                 "max_qty": it.max_qty, "max_spend": it.max_spend, "bought": qty, "spent": spent,
                 "steam_at": steam.get("at"), "steam_error": steam.get("error"),
@@ -444,7 +448,7 @@ class Dashboard:
             "now": now, "started_at": self.started_at, "version": __version__,
             "mode": self.s.mode, "strategy": self.s.strategy, "paused": sw.paused,
             "poll_interval": self.s.poll_interval, "steam_refresh_sec": self.s.steam_refresh_sec,
-            "sell_window_days": self.s.steam_sell_window_days,
+            "sell_window_days": self.s.steam_sell_window_days, "sell_volume_share": self.s.steam_sell_volume_share,
             "steam_currency": self.s.steam_currency, "usd_wallet": self.usd_wallet,
             "cycle": {"n": self.cycle_n, "at": self.cycle_at, "error": self.cycle_error,
                       "done": bool(view.get("done"))},

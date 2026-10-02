@@ -127,16 +127,19 @@ def test_parse_history_time():
     assert parse_history_time("Jan 02 2026 00: +0") == 1767312000.0
 
 
-def test_sell_price_from_history_takes_window_max():
+def test_sell_price_from_history_by_volume_share():
     now = 1790900000.0
     pts = [HistoryPoint(now - 5 * 86400, 9.99, 3000),    # 窗口外
            HistoryPoint(now - 2 * 86400, 1.12, 2500),
-           HistoryPoint(now - 1 * 86400, 1.15, 10),
+           HistoryPoint(now - 1 * 86400, 1.15, 10),      # 最高价只成交了 10 件：挂这个价要排队
            HistoryPoint(now - 3600, 1.06, 3100),
            HistoryPoint(now - 7200, 1.15, 0)]            # 没成交量的不算
+    # 总量 5610，30% = 1683：1.15 只累计 10，1.12 累计 2510 -> 挂 1.12
     s = sell_price_from_history(pts, 3, now)
-    assert (s.price, s.volume, s.ts) == (1.15, 10, now - 86400)
-    assert sell_price_from_history(pts, 0.5, now).price == 1.06
+    assert (s.price, s.volume, s.total, s.high, s.share) == (1.12, 2510, 5610, 1.15, 0.3)
+    assert sell_price_from_history(pts, 3, now, share=0.001).price == 1.15   # 比例极小 = 最高价
+    assert sell_price_from_history(pts, 3, now, share=1.0).price == 1.06     # 全部成交量 = 窗口内最低
+    assert sell_price_from_history(pts, 0.5, now).price == 1.06              # 窗口只剩最近 12 小时
     assert sell_price_from_history([], 3, now) is None
 
 

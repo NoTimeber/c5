@@ -58,9 +58,11 @@ class PriceHistory:
 
 @dataclass(frozen=True)
 class SellPrice:
-    price: float    # 窗口内最高的小时中位价：按这个价挂单，最近几天是能成交的
-    volume: int     # 那个小时成交了多少件
-    ts: float       # 那个小时
+    price: float    # 挂单价：窗口内从高价往下累计成交量，累计到总量 share 比例时的那个小时中位价
+    volume: int     # 窗口内在这个价或更高价成交了多少件
+    total: int      # 窗口内总成交量
+    high: float     # 窗口内最高的小时中位价（参考）
+    share: float    # 用的比例
 
 
 def parse_money(text) -> float | None:
@@ -98,14 +100,25 @@ def discount(c5_price: float, steam_price: float | None) -> float | None:
     return c5_price / net if net > 0 else None
 
 
-def sell_price_from_history(points: list[HistoryPoint], days: float, now: float | None = None) -> SellPrice | None:
-    """最近 days 天里最高的小时中位价。小时中位价本身是几百上千笔成交的中位数，不会被一两笔异常成交带偏。"""
+def sell_price_from_history(points: list[HistoryPoint], days: float, now: float | None = None,
+                            share: float = 0.3) -> SellPrice | None:
+    """能大批量卖出的挂单价：最近 days 天的小时成交记录按价从高到低累计成交量，累计到总量的 share 比例时的那个价。
+    share=0.3 表示最近几天有 30% 的成交是在这个价或更高价成交的：这个价经常到、量也大，挂上去能走。
+    只取最高价会排队等价格回来，share 越小越接近最高价、越难卖；share=1 就是窗口内最低的小时中位价。"""
     now = time.time() if now is None else now
     recent = [p for p in points if p.ts >= now - days * 86400 and p.volume > 0 and p.price > 0]
     if not recent:
         return None
-    best = max(recent, key=lambda p: (p.price, p.ts))
-    return SellPrice(price=best.price, volume=best.volume, ts=best.ts)
+    share = min(max(share, 0.001), 1.0)
+    total = sum(p.volume for p in recent)
+    high = max(p.price for p in recent)
+    acc = 0
+    for p in sorted(recent, key=lambda p: p.price, reverse=True):
+        acc += p.volume
+        if acc >= total * share:
+            return SellPrice(price=p.price, volume=acc, total=total, high=high, share=share)
+    p = recent[-1]
+    return SellPrice(price=p.price, volume=total, total=total, high=high, share=share)
 
 
 def fmt_wait(sec: float) -> str:

@@ -176,7 +176,10 @@
       const spendCap = i.max_spend ? ` / ${num(i.max_spend)}` : "";
       const targetSub = i.target_auto ? `<div class="sub-cell">${i.c5_target == null ? "等 Steam 价" : "按汇率"}</div>` : "";
       let sellSub;
-      if (i.sell_src === "history") sellSub = `<div class="sub-cell" title="最近 ${s.sell_window_days} 天成交历史里最高的小时中位价，${fmtTime(i.sell_at, true)} 那小时成交 ${int(i.sell_volume)} 件${i.sell_usd != null ? `。登录账号是美元区，$${num(i.sell_usd)} 按 Steam 汇率换算` : ""}">${s.sell_window_days} 天最高${i.sell_usd != null ? ` $${num(i.sell_usd)}` : ""} · ${int(i.sell_volume)} 件</div>`;
+      if (i.sell_src === "history") {
+        const pct = Math.round((i.sell_share || s.sell_volume_share) * 100);
+        sellSub = `<div class="sub-cell" title="最近 ${s.sell_window_days} 天共成交 ${int(i.sell_total)} 件，其中 ${int(i.sell_volume)} 件（${pct}%）在这个价或更高价成交；窗口内最高小时中位价 ${cur(i.sell_high)}${i.sell_usd != null ? `。登录账号是美元区，$${num(i.sell_usd, 3)} 按 Steam 汇率换算` : ""}">${s.sell_window_days} 天 ${pct}% 成交 ≥ 此价 · 最高 ${cur(i.sell_high)}</div>`;
+      }
       else if (i.history_error) sellSub = `<div class="sub-cell down" title="${esc(i.history_error)}">按最低价（历史失败）</div>`;
       else sellSub = `<div class="sub-cell">按最低价</div>`;
       return `<tr>
@@ -224,7 +227,7 @@
     const form = $("#steam-login-form"), guard = $("#steam-guard-form"), status = $("#steam-status"), logout = $("#steam-logout");
     $("#steam-sub").textContent = sl.account ? "挂单价按成交历史" : "挂单价按最低价";
     if (sl.account) {
-      status.innerHTML = `已登录 <b>${esc(sl.account)}</b>。挂单价取最近 ${state.sell_window_days} 天成交历史里最高的小时中位价，净到手、折扣、目标价都按它算。` +
+      status.innerHTML = `已登录 <b>${esc(sl.account)}</b>。挂单价按最近 ${state.sell_window_days} 天成交历史算：有 ${Math.round(state.sell_volume_share * 100)}% 的成交在此价或更高价成交，净到手、折扣、目标价都按它算。` +
         `登录态自动续期，最晚到 ${fmtDate(sl.refresh_exp)} 需要重新登录。` + (sl.error ? ` <span class="down">${esc(sl.error)}</span>` : "");
       form.hidden = true; guard.hidden = true; logout.hidden = false;
     } else if (sl.pending) {
@@ -239,7 +242,7 @@
       if (!pollTimer) pollTimer = setInterval(pollLogin, 3000);
     } else {
       status.innerHTML = (sl.error ? `<span class="down">${esc(sl.error)}</span> ` : "") +
-        "未登录：挂单价按当前最低挂单价算。登录后按最近几天成交历史的最高价算，更接近挂单卖出的实际到手。用一个没有库存和余额的小号即可。";
+        "未登录：挂单价按当前最低挂单价算。登录后按最近几天的成交历史算（能大批量卖出的价），更接近挂单卖出的实际到手。用一个没有库存和余额的小号即可。";
       form.hidden = false; guard.hidden = true; logout.hidden = true;
     }
     if (!sl.pending && pollTimer) { clearInterval(pollTimer); pollTimer = null; }

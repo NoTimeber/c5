@@ -300,7 +300,8 @@ def test_refresh_uses_history_sell_price_when_logged_in(env, monkeypatch):
     now = time.time()
     prices = {CASE.name: SteamPrice(1.17, 1.15, 80000), OTHER.name: SteamPrice(1.67, 1.67, 101052),
               dash.s.steam_rate_item: SteamPrice(243.0, 250.0, 93)}
-    history = {CASE.name: PriceHistory([HistoryPoint(now - 86400, 1.30, 500), HistoryPoint(now - 3600, 1.17, 3000),
+    # 1.30 这一档成交 2000 件，占窗口内 5000 件的 40% >= 30% -> 挂 1.30
+    history = {CASE.name: PriceHistory([HistoryPoint(now - 86400, 1.30, 2000), HistoryPoint(now - 3600, 1.17, 3000),
                                         HistoryPoint(now - 10 * 86400, 2.00, 100)], "¥ "),
                OTHER.name: PriceHistory([HistoryPoint(now - 3600, 9.00, 10)], "¥ ")}   # 和当前中位价 1.67 差太多：疑似币种不对
     calls = []
@@ -328,7 +329,8 @@ def test_refresh_uses_history_sell_price_when_logged_in(env, monkeypatch):
     assert [c[1] for c in calls if c[0] == "history"] == [CASE.name, OTHER.name]
     st = web.get("/api/state").json()
     kilo, rev = st["items"]
-    assert kilo["sell_src"] == "history" and kilo["steam_sell"] == 1.30 and kilo["sell_volume"] == 500
+    assert kilo["sell_src"] == "history" and kilo["steam_sell"] == 1.30
+    assert (kilo["sell_volume"], kilo["sell_total"], kilo["sell_high"], kilo["sell_share"]) == (2000, 5000, 1.30, 0.3)
     assert kilo["steam_lowest"] == 1.17 and kilo["steam_net"] == pytest.approx(1.14)
     disc = 5.0 / (243.0 / 36.05)
     assert sweeper.auto_targets[CASE.name] == int(1.14 * disc * 100 + 1e-9) / 100
