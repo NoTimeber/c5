@@ -6,21 +6,26 @@ app_id = 730        # 730 = CS2
 delivery = 0        # 0 不限 / 1 只要人工发货 / 2 只要自动发货
 asset_type = 1      # 1 普通在售 / 2 冷却期在售
 
-# 下面的 max_price 是按 2026-09-30 的 Steam 价按 7 折余额倒推的示例（Steam 最低价扣完手续费 × 0.7）。
+# 下面的 max_price 是按 2026-10-02 的 Steam 价按 7 折余额倒推的示例（Steam 最低价扣完手续费 × 0.7）。
 # 先跑 `uv run python -m c5bot compare` 看当天的价再定。
 
 [[items]]
-name = "Kilowatt Case"      # Steam 市场英文名（marketHashName），必须完全一致
-max_price = 0.70            # 单价不高于此值才买。Steam 1.17 -> 到手 1.02，0.70 约 6.9 折
+name = "Kilowatt Case"      # 千瓦武器箱。Steam 市场英文名（marketHashName），必须完全一致
+max_price = 0.66            # 单价不高于此值才买。Steam 1.08 -> 到手 0.95，0.66 约 6.9 折
 max_qty = 100               # 累计最多买多少个，重启不清零
 # max_spend = 60            # 这个箱子累计花费上限，不写 = 不限（仍受总预算约束）
 
 [[items]]
-name = "Revolution Case"
-max_price = 1.05            # Steam 1.73 -> 到手 1.51
+name = "Dreams & Nightmares Case"   # 梦魇武器箱
+max_price = 6.14            # Steam 10.07 -> 到手 8.77
 max_qty = 100
 
 [[items]]
-name = "Fracture Case"
-max_price = 2.50            # Steam 4.16 -> 到手 3.62
-max_qty = 50
+name = "Revolution Case"    # 变革武器箱
+max_price = 1.02            # Steam 1.67 -> 到手 1.46
+max_qty = 100
+
+[[items]]
+name = "Recoil Case"        # 反冲武器箱
+max_price = 1.48            # Steam 2.42 -> 到手 2.11
+max_qty = 100
