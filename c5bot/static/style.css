@@ -129,3 +129,13 @@ tbody tr:hover td { background: rgba(127, 127, 127, 0.06); }
 
 .alert { border: 1px solid var(--warn); background: var(--warn-bg); border-radius: 8px; padding: 10px 12px; font-size: 13px; }
 footer { max-width: 1400px; margin: 24px auto 0; }
+
+.rate-form { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; padding-right: 8px; border-right: 1px solid var(--grid); margin-right: 4px; }
+.rate-form label { color: var(--ink-2); font-size: 12px; }
+.rate-form input {
+  width: 76px; padding: 3px 8px; font: inherit; font-size: 13px; font-variant-numeric: tabular-nums;
+  color: var(--ink); background: var(--page); border: 1px solid var(--border); border-radius: 6px;
+}
+.rate-form input:focus { outline: none; border-color: var(--accent); }
+@media (max-width: 900px) { .rate-form { border-right: none; padding-right: 0; margin-right: 0; width: 100%; } }
+.tile .value.small { font-size: 18px; }

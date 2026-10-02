@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from c5bot.steam import SteamMarket, discount, parse_money, seller_receives
+from c5bot.steam import USD, SteamMarket, discount, parse_money, seller_receives
 
 
 def test_steam_session_never_advertises_brotli():
@@ -33,3 +33,23 @@ def test_discount():
     assert discount(0.75, 1.17) == pytest.approx(0.75 / 1.02)
     assert discount(0.75, None) is None
     assert discount(0.75, 0.02) is None
+
+
+def test_price_currency_override(monkeypatch):
+    m = SteamMarket(currency=23)
+    seen = []
+
+    class Resp:
+        status_code = 200
+
+        def json(self):
+            return {"success": True, "lowest_price": "$1.40", "median_price": "$1.39", "volume": "100"}
+
+    def fake_get(url, *, timeout, params):
+        seen.append(params["currency"])
+        return Resp()
+    monkeypatch.setattr(m._http, "get", fake_get)
+    monkeypatch.setattr(m, "_throttle", lambda: None)
+    assert m.price(730, "Kilowatt Case").lowest == 1.40
+    assert m.price(730, "Kilowatt Case", currency=USD).lowest == 1.40
+    assert seen == [23, USD]

@@ -3,8 +3,9 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
+from c5bot.compare import SteamRate
 from c5bot.config import Settings, WatchItem
-from c5bot.steam import SteamPrice
+from c5bot.steam import USD, SteamError, SteamPrice
 from c5bot.store import Store
 from c5bot.sweeper import Sweeper
 from c5bot.web import Dashboard, LogBuffer, create_app
@@ -84,3 +85,89 @@ def test_index_and_static_served(env):
     _, _, _, web = env
     assert "C5 扫货看板" in web.get("/").text
     assert web.get("/static/app.js").status_code == 200
+
+
+# ---------- 目标汇率 ----------
+
+def test_set_target_rate_computes_targets_and_persists(env, tmp_path):
+    dash, sweeper, client, web = env
+    dash.steam[CASE.name] = {"price": SteamPrice(1.17, 1.15, 80000), "at": 1e12, "error": None}
+    dash.steam_rate = SteamRate(rate=7.2, name=CASE.name, cny=1.17, usd=0.1625, at=1e12)
+
+    assert web.post("/api/rate", json={"rate": "abc"}).status_code == 400
+    assert web.post("/api/rate", json={"rate": 500}).status_code == 400
+    assert sweeper.auto_targets is None
+
+    assert web.post("/api/rate", json={"rate": 5.04}).json() == {"ok": True, "rate": 5.04}
+    assert (tmp_path / "dashboard.json").read_text(encoding="utf-8") == '{"target_rate": 5.04}'
+    # 5.04 / 7.2 = 0.7 折；Kilowatt 到手 1.02 × 0.7 = 0.714 -> 0.71；Revolution 没有 Steam 价 -> None
+    assert sweeper.auto_targets == {CASE.name: 0.71, OTHER.name: None}
+    sweeper.run_cycle()
+    st = web.get("/api/state").json()
+    assert st["rate"]["target"] == 5.04 and st["rate"]["discount"] == pytest.approx(0.7)
+    assert st["rate"]["steam"]["rate"] == 7.2 and st["rate"]["steam"]["name"] == CASE.name
+    kilo, rev = st["items"]
+    assert kilo["c5_target"] == 0.71 and kilo["target_auto"] is True and kilo["max_price"] == 0.7
+    assert kilo["status"] == "hit" and kilo["rate_at_lowest"] == pytest.approx(0.65 / 1.02 * 7.2)
+    assert rev["c5_target"] is None and rev["status"] == "nosteam" and rev["target_auto"] is True
+    # 在售 0.65 和 0.68 都 <= 0.71，买了两个
+    assert len(st["purchases"]) == 2
+
+    assert web.post("/api/rate", json={"rate": None}).json() == {"ok": True, "rate": None}
+    assert sweeper.auto_targets is None
+    st = web.get("/api/state").json()
+    assert st["items"][0]["c5_target"] == 0.7 and st["items"][0]["target_auto"] is False
+    assert st["items"][1]["status"] == "watch"
+
+
+def test_target_rate_loaded_at_start_and_waits_for_steam(tmp_path):
+    (tmp_path / "dashboard.json").write_text('{"target_rate": 5.0}', encoding="utf-8")
+    s = Settings(app_key="k", mode="dry", data_dir=tmp_path)
+    sweeper = Sweeper(s, [CASE], FakeClient(), Store(tmp_path / "t.sqlite"), clock=Clock())
+    dash = Dashboard(s, sweeper, tmp_path / "t.sqlite", LogBuffer())
+    assert dash.target_rate == 5.0
+    assert sweeper.auto_targets == {CASE.name: None}  # 还没有 Steam 价，先不买
+
+
+def test_refresh_steam_fetches_rate_and_applies_targets(env, monkeypatch):
+    dash, sweeper, client, web = env
+    prices = {
+        (CASE.name, None): SteamPrice(1.08, 1.08, 86298),
+        (OTHER.name, None): SteamPrice(1.67, 1.67, 101052),
+        (OTHER.name, USD): SteamPrice(0.232, 0.232, 101052),  # 贵的那个查美元价
+    }
+    calls = []
+
+    def fake_price(app_id, name, *, currency=None):
+        calls.append((name, currency))
+        return prices[(name, currency)]
+    monkeypatch.setattr(dash._steam, "price", fake_price)
+    dash.set_target_rate(5.0)
+    dash.refresh_steam()
+    assert calls == [(CASE.name, None), (OTHER.name, None), (OTHER.name, USD)]
+    assert dash.steam_rate.rate == pytest.approx(1.67 / 0.232) and dash.steam_rate.name == OTHER.name
+    disc = 5.0 / (1.67 / 0.232)
+    assert sweeper.auto_targets == {
+        CASE.name: int(0.95 * disc * 100 + 1e-9) / 100,    # 1.08 -> 到手 0.95
+        OTHER.name: int(1.46 * disc * 100 + 1e-9) / 100,   # 1.67 -> 到手 1.46
+    }
+    assert (dash.s.data_dir / "compare.csv").exists()
+
+    # 美元价查失败：沿用上次的汇率，目标价照常
+    def flaky(app_id, name, *, currency=None):
+        if currency == USD:
+            raise SteamError("Steam 限流（429）")
+        return prices[(name, currency)]
+    monkeypatch.setattr(dash._steam, "price", flaky)
+    dash.refresh_steam()
+    assert dash.steam_rate.rate == pytest.approx(1.67 / 0.232) and "429" in dash.steam_rate_error
+    assert sweeper.auto_targets[CASE.name] == int(0.95 * disc * 100 + 1e-9) / 100
+
+
+def test_reload_watchlist_recomputes_targets(env, tmp_path):
+    dash, sweeper, client, web = env
+    dash.steam_rate = SteamRate(rate=7.0, name=CASE.name, cny=1.17, usd=0.167, at=1e12)
+    dash.set_target_rate(4.9)  # 7 折
+    (tmp_path / "watchlist.toml").write_text('[[items]]\nname = "Fracture Case"\nmax_price = 2.5\nmax_qty = 5\n', encoding="utf-8")
+    assert web.post("/api/watchlist/reload").json()["ok"] is True
+    assert sweeper.auto_targets == {"Fracture Case": None}

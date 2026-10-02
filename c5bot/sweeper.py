@@ -84,11 +84,19 @@ class Sweeper:
         self._clock = clock
         self._skip_until: dict[int, float] = {}         # 在售 id -> 此时间前不再尝试
         self._pause_until: dict[str, float] = {}        # 饰品名 -> 此时间前不再下单
-        self._last_price: dict[str, float | None] = {}
-        # 下面三个给看板用：看板线程只读 view、只写 paused / refresh_requested
+        self._last_price: dict[str, tuple] = {}
+        # 下面几个给看板用：看板线程只读 view、只写 paused / refresh_requested / auto_targets
         self.paused = False                 # 暂停扫货：照常看行情，不下单
         self.refresh_requested = False      # 请求下一轮立即对全部订单对账
         self.view: dict = {}                # 每轮结束后发布的快照，整体替换不原地改
+        # 看板按目标汇率算出的每个饰品的目标价；None = 没设目标汇率，用 watchlist 的 max_price。
+        # 设了汇率但某个饰品的 Steam 价还没拿到，对应值是 None，这个饰品这一轮不买
+        self.auto_targets: dict[str, float | None] | None = None
+
+    def target(self, it: WatchItem) -> float | None:
+        """这一轮实际用的目标价。"""
+        auto = self.auto_targets
+        return it.max_price if auto is None else auto.get(it.name)
 
     # ---------- 主循环的一轮 ----------
 
@@ -117,8 +125,9 @@ class Sweeper:
         for it in todo:
             st = stats.get(it.name) or {}
             price = _num(st.get("sellPrice"))
-            self._log_price(it, st, price)
-            if price is None or price <= 0 or price > it.max_price + EPS:
+            tgt = self.target(it)
+            self._log_price(it, st, price, tgt)
+            if price is None or price <= 0 or tgt is None or price > tgt + EPS:
                 continue
             if self.paused or cycle_left <= 0 or self._clock() < self._pause_until.get(it.name, 0.0):
                 continue
@@ -127,9 +136,9 @@ class Sweeper:
             money = min(budget, self._spend_left(it, totals), math.inf if balance is None else balance)
             qty = min(self._qty_left(it, totals), cycle_left)
             if self.s.strategy == "quick":
-                bought, cost = self._sweep_quick(it, price, qty, money)
+                bought, cost = self._sweep_quick(it, price, qty, money, tgt)
             else:
-                bought, cost = self._sweep_listing(it, qty, money)
+                bought, cost = self._sweep_listing(it, qty, money, tgt)
             cycle_left -= bought
             budget -= cost
             if balance is not None:
@@ -144,15 +153,17 @@ class Sweeper:
     def _spend_left(self, it: WatchItem, totals: dict[str, Total]) -> float:
         return _left(it.max_spend, totals.get(it.name, Total()).spent)
 
-    def _log_price(self, it: WatchItem, st: dict, price: float | None) -> None:
-        if it.name in self._last_price and self._last_price[it.name] == price:
+    def _log_price(self, it: WatchItem, st: dict, price: float | None, tgt: float | None) -> None:
+        # 价格或目标价有变化才记一条，避免每 3 秒刷屏
+        if self._last_price.get(it.name) == (price, tgt):
             return
-        self._last_price[it.name] = price
+        self._last_price[it.name] = (price, tgt)
         if price is None:
             log.warning("查不到 %s 的行情，检查 name 是否是正确的 marketHashName", it.name)
         else:
-            log.info("%s 最低 %.2f（目标 ≤ %.2f） 在售 %s 求购最高 %s",
-                     it.name, price, it.max_price, st.get("sellCount"), st.get("purchaseMaxPrice"))
+            log.info("%s 最低 %.2f（%s） 在售 %s 求购最高 %s", it.name, price,
+                     f"目标 ≤ {tgt:.2f}" if tgt is not None else "目标价等 Steam 价",
+                     st.get("sellCount"), st.get("purchaseMaxPrice"))
 
     def _pause(self, it: WatchItem, reason) -> None:
         self._pause_until[it.name] = self._clock() + self.s.error_cooldown
@@ -160,14 +171,14 @@ class Sweeper:
 
     # ---------- listing 策略：查在售列表，按在售 id 批量买 ----------
 
-    def _sweep_listing(self, it: WatchItem, qty: int, money: float) -> tuple[int, float]:
-        raw = self.client.search_products(app_id=it.app_id, name=it.name, price_max=it.max_price,
+    def _sweep_listing(self, it: WatchItem, qty: int, money: float, tgt: float) -> tuple[int, float]:
+        raw = self.client.search_products(app_id=it.app_id, name=it.name, price_max=tgt,
                                           delivery=it.delivery, asset_type=it.asset_type)
         now = self._clock()
         self._skip_until = {pid: t for pid, t in self._skip_until.items() if t > now}
         picks = pick_listings(
             [l for l in map(parse_listing, raw) if l],
-            max_price=it.max_price, qty_left=qty, budget_left=money,
+            max_price=tgt, qty_left=qty, budget_left=money,
             skip_ids=self.store.product_ids(self.s.mode) | self._skip_until.keys(),
         )
         if not picks:
@@ -227,7 +238,7 @@ class Sweeper:
 
     # ---------- quick 策略：平台挑最低价，一次一件 ----------
 
-    def _sweep_quick(self, it: WatchItem, price: float, qty: int, money: float) -> tuple[int, float]:
+    def _sweep_quick(self, it: WatchItem, price: float, qty: int, money: float, tgt: float) -> tuple[int, float]:
         if self.s.mode == "dry":
             # 拿不到在售明细，每轮按当前最低价模拟买一件
             if price > money + EPS:
@@ -238,18 +249,18 @@ class Sweeper:
             return 1, price
 
         bought, cost = 0, 0.0
-        # 成交价事先不知道，预算按 max_price 预留
-        while bought < qty and it.max_price <= money - cost + EPS:
+        # 成交价事先不知道，预算按目标价预留
+        while bought < qty and tgt <= money - cost + EPS:
             no = new_out_trade_no()
-            self.store.add(no, mode="live", name=it.name, product_id="", price=it.max_price,
+            self.store.add(no, mode="live", name=it.name, product_id="", price=tgt,
                            status="unknown", ts=self._clock())
             try:
                 data = self.client.quick_buy(out_trade_no=no, trade_url=self.s.trade_url,
-                                             app_id=it.app_id, name=it.name, max_price=it.max_price,
+                                             app_id=it.app_id, name=it.name, max_price=tgt,
                                              delivery=it.delivery)
             except C5NetworkError as e:
-                log.error("%s 下单结果未知（%s），先按 %.2f 计入预算，稍后自动对账", it.name, e, it.max_price)
-                return bought + 1, cost + it.max_price
+                log.error("%s 下单结果未知（%s），先按 %.2f 计入预算，稍后自动对账", it.name, e, tgt)
+                return bought + 1, cost + tgt
             except C5Error as e:
                 self.store.update(no, status="failed", error=str(e))
                 self._pause(it, e)
@@ -258,7 +269,7 @@ class Sweeper:
                 self.store.update(no, status="failed", error="支付失败")
                 self._pause(it, "支付失败")
                 break
-            pay = _num(data.get("actualPay")) or it.max_price
+            pay = _num(data.get("actualPay")) or tgt
             self.store.update(no, status="ok", order_id=str(data.get("orderId") or ""), actual_pay=pay)
             log.info("买入 %s %.2f，订单 %s", it.name, pay, data.get("orderId"))
             bought, cost = bought + 1, cost + pay

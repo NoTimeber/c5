@@ -286,3 +286,40 @@ def test_quick_reserves_max_price_per_buy(env):
     sw.run_cycle()
     # 成交 5.0 两次后剩 2.0，不够 max_price 5.5，停手
     assert client.count("quick_buy") == 2
+
+
+# ---------- 看板按目标汇率算的目标价 ----------
+
+def test_auto_target_overrides_watchlist_price(env):
+    sw, client, store, _ = env()
+    client.listings = [listing(1, 5.0), listing(2, 5.2), listing(3, 5.4)]
+    sw.auto_targets = {CASE.name: 5.1}  # watchlist 写的 5.5，看板按汇率算出 5.1
+    sw.run_cycle()
+    (_, kw), = [c for c in client.calls if c[0] == "search_products"]
+    assert kw["price_max"] == 5.1
+    assert [p.product_id for p in store.select("live")] == ["1"]
+    # 行情 5.0 没变，但目标价涨到 5.3 -> 多买一个 5.2 的
+    sw.auto_targets = {CASE.name: 5.3}
+    sw.run_cycle()
+    assert [p.product_id for p in store.select("live")] == ["1", "2"]
+
+
+def test_auto_target_missing_means_no_buy(env):
+    sw, client, store, _ = env()
+    client.listings = [listing(1, 5.0)]
+    sw.auto_targets = {CASE.name: None}  # 设了汇率但这个饰品的 Steam 价还没拿到
+    assert sw.run_cycle() is True
+    assert client.count("search_products") == 0 and store.select("live") == []
+    sw.auto_targets = None  # 清除汇率，回到 watchlist 的 5.5
+    sw.run_cycle()
+    assert [p.product_id for p in store.select("live")] == ["1"]
+
+
+def test_quick_uses_auto_target(env):
+    sw, client, store, _ = env(strategy="quick", max_total_spend=12.0)
+    sw.auto_targets = {CASE.name: 5.2}
+    sw.run_cycle()
+    kws = [c[1] for c in client.calls if c[0] == "quick_buy"]
+    assert kws and all(kw["max_price"] == 5.2 for kw in kws)
+    # 成交 5.0 两次后剩 2.0，不够目标价 5.2，停手
+    assert len(kws) == 2

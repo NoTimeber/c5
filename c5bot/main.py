@@ -10,9 +10,9 @@ import unicodedata
 from datetime import datetime
 
 from .client import C5Client, C5Error
-from .compare import append_csv, c5_lowest, compare_row
+from .compare import SteamRate, append_csv, c5_lowest, compare_row, fetch_steam_rate
 from .config import Settings, WatchItem, load_settings, load_watchlist
-from .steam import SteamError, SteamMarket
+from .steam import SteamError, SteamMarket, SteamPrice
 from .store import Store
 from .sweeper import Sweeper, parse_listing
 from .web import Dashboard, LogBuffer, create_app, serve_in_thread
@@ -93,31 +93,43 @@ def _fmt_discount(d: float | None) -> str:
 
 
 def cmd_compare(s: Settings, every: float) -> int:
-    """C5 最低价 vs Steam 最低挂单价，算 1 元 Steam 余额要花多少钱。"""
+    """C5 最低价 vs Steam 最低挂单价，算 1 元 Steam 余额要花多少钱、1 美元余额花多少人民币。"""
     items = load_watchlist()
     client = make_client(s)
     steam = SteamMarket(proxy=s.steam_proxy, currency=s.steam_currency, timeout=s.timeout)
-    widths = [max(28, *(_width(it.name) + 2 for it in items)), 8, 8, 10, 8, 12, 12, 10, 9]
+    widths = [max(28, *(_width(it.name) + 2 for it in items)), 8, 8, 10, 8, 12, 12, 12, 10, 9]
     while True:
         stats = _fetch_stats(client, items)
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        print(f"\n{now}  Steam 价为当前最低挂单价，净到手 = 扣 Steam 5% + CS2 10% 手续费后。"
-              f"C5 买到的 7 天后才能挂 Steam，折扣按今天价算，仅供参考。")
-        print(_row(["箱子", "C5最低", "目标价", "Steam最低", "净到手", "折(C5最低)", "折(目标价)",
-                    "Steam中位", "24h成交"], widths))
-        rows = []
+        priced: list[tuple[WatchItem, float | None, SteamPrice]] = []
+        failed: list[tuple[WatchItem, float | None, str]] = []
         for it in items:
             c5 = c5_lowest(stats.get(it.name))
             try:
-                sp = steam.price(it.app_id, it.name)
+                priced.append((it, c5, steam.price(it.app_id, it.name)))
             except SteamError as e:
-                print(_row([it.name, c5], widths[:2]) + f"  Steam 查询失败: {e}")
-                continue
-            r = compare_row(it, c5, sp)
+                failed.append((it, c5, str(e)))
+        rate: SteamRate | None = None
+        try:
+            rate = fetch_steam_rate(steam, [(it, sp) for it, _, sp in priced])
+        except SteamError as e:
+            print(f"Steam 汇率查询失败: {e}")
+        print(f"\n{now}  Steam 价为当前最低挂单价，净到手 = 扣 Steam 5% + CS2 10% 手续费后。"
+              f"C5 买到的 7 天后才能挂 Steam，折扣按今天价算，仅供参考。")
+        if rate:
+            print(f"Steam 汇率 {rate.rate:.4f} 元/USD（{rate.name} ¥{rate.cny:.2f} / ${rate.usd:.2f}）。"
+                  f"汇率(C5最低) = 按 C5 最低价买入，1 美元 Steam 余额花多少人民币。")
+        print(_row(["箱子", "C5最低", "目标价", "Steam最低", "净到手", "折(C5最低)", "汇率(C5最低)", "折(目标价)",
+                    "Steam中位", "24h成交"], widths))
+        rows = []
+        for it, c5, sp in priced:
+            r = compare_row(it, c5, sp, rate=rate.rate if rate else None)
             rows.append(r)
             print(_row([r.name, r.c5_lowest, r.c5_target, r.steam_lowest, r.steam_net,
-                        _fmt_discount(r.discount_at_lowest), _fmt_discount(r.discount_at_target),
+                        _fmt_discount(r.discount_at_lowest), r.rate_at_lowest, _fmt_discount(r.discount_at_target),
                         r.steam_median, r.steam_volume], widths))
+        for it, c5, err in failed:
+            print(_row([it.name, c5], widths[:2]) + f"  Steam 查询失败: {err}")
         append_csv(s.data_dir / "compare.csv", now, rows)
         if not every:
             return 0

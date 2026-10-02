@@ -12,7 +12,7 @@
   const zhe = (d) => d == null ? "-" : `${(d * 10).toFixed(2)}折`;
   const zheCls = (d) => d == null ? "" : d <= 0.75 ? "up" : d >= 0.9 ? "down" : "";
   const badge = (text, cls) => `<span class="badge ${cls}">${esc(text)}</span>`;
-  const STATUS = { hit: ["到价", "hit"], watch: ["监控中", "watch"], cooldown: ["冷却", "cooldown"], done: ["已买满", "done"], unknown: ["无行情", "fail"] };
+  const STATUS = { hit: ["到价", "hit"], watch: ["监控中", "watch"], cooldown: ["冷却", "cooldown"], done: ["已买满", "done"], unknown: ["无行情", "fail"], nosteam: ["等 Steam 价", "warn"] };
   const PSTATUS = { ok: ["成交", "ok"], unknown: ["未知", "warn"], failed: ["失败", "fail"], cancelled: ["已取消", "muted"] };
   const ORDER = { 1: "待发货", 2: "发货中", 3: "待收货", 10: "已收货", 11: "已取消", 200: "结算", 220: "已撤回" };
 
@@ -49,9 +49,14 @@
       setConn(false);
     }
   }
-  async function post(url) {
+  async function post(url, body) {
     try {
-      const r = await fetch(url, { method: "POST" });
+      const opts = { method: "POST" };
+      if (body !== undefined) {
+        opts.headers = { "Content-Type": "application/json" };
+        opts.body = JSON.stringify(body);
+      }
+      const r = await fetch(url, opts);
       const j = await r.json();
       if (!j.ok) alert(j.error || "操作失败");
     } catch (e) {
@@ -69,6 +74,7 @@
   function render() {
     renderTop();
     renderKpis();
+    renderRateForm();
     renderItems();
     renderPurchases();
     renderLogs();
@@ -100,6 +106,8 @@
       (bar == null ? "" : `<div class="bar"><i style="width:${Math.min(100, bar)}%"></i></div>`) + `</div>`;
     const b = s.budget;
     const pct = b.total ? (b.spent / b.total) * 100 : null;
+    const r = s.rate || {};
+    const sr = r.steam;
     const tiles = [
       tile("已花费", num(b.spent), b.total ? `预算 ${num(b.total)} · 剩 ${num(b.total - b.spent)}` : "总预算不限", "", pct),
       tile("已买入", `${int(b.qty)} 件`, `${s.items.filter((i) => i.status === "done").length} / ${s.items.length} 个箱子买满`),
@@ -107,10 +115,29 @@
         ? tile("C5 余额", num(s.balance.value), s.balance.at ? `${ago(s.balance.at)} 更新` : "还没查到")
         : tile("C5 余额", "模拟", "dry 模式不查余额也不花钱"),
       tile("Steam 价", s.steam.at ? ago(s.steam.at) : "未拉取", `每 ${Math.round(s.steam_refresh_sec / 60)} 分钟刷新`),
+      sr
+        ? tile("Steam 汇率", `${num(sr.rate, 3)} <span class="muted">元/USD</span>`, `按 ${esc(sr.name)} ¥${num(sr.cny)} / $${num(sr.usd)} · ${ago(sr.at)}`)
+        : tile("Steam 汇率", "未知", r.steam_error ? esc(r.steam_error) : "等第一次 Steam 刷新", "small"),
+      r.target != null
+        ? tile("目标汇率", `${num(r.target)} <span class="muted">元/USD</span>`,
+          r.discount != null ? `= ${zhe(r.discount)}，目标价随 Steam 价自动算` : "等 Steam 汇率后生效，期间不买", r.discount != null ? "" : "small")
+        : tile("目标汇率", "未设置", "目标价用 watchlist 里的 max_price", "small"),
     ];
     const hits = s.items.filter((i) => i.status === "hit");
     tiles.push(tile("到价", `${hits.length} 个`, hits.map((i) => i.name).join("、") || "都还没到目标价", hits.length ? "up" : ""));
     $("#kpis").innerHTML = tiles.join("");
+  }
+
+  // 输入框是静态元素，不随 2 秒一次的渲染重建；只在服务端的值变了、而且用户没在编辑时同步进来
+  let shownRate;
+  function renderRateForm() {
+    const input = $("#rate-input");
+    const target = state.rate ? state.rate.target : null;
+    if (target !== shownRate && document.activeElement !== input) {
+      input.value = target == null ? "" : String(target);
+      shownRate = target;
+    }
+    $("#rate-clear").hidden = target == null;
   }
 
   function renderItems() {
@@ -125,16 +152,18 @@
       const cool = i.status === "cooldown" && i.pause_until ? `<div class="sub-cell">${Math.max(0, Math.round(i.pause_until - s.now))}s</div>` : "";
       const steamSub = i.steam_error ? `<div class="sub-cell down">${esc(i.steam_error)}</div>` : i.steam_at ? `<div class="sub-cell">${ago(i.steam_at)}</div>` : "";
       const spendCap = i.max_spend ? ` / ${num(i.max_spend)}` : "";
+      const targetSub = i.target_auto ? `<div class="sub-cell">${i.c5_target == null ? "等 Steam 价" : "按汇率"}</div>` : "";
       return `<tr>
         <td class="l"><b>${esc(i.name)}</b></td>
         <td class="l">${badge(text, cls)}${cool}</td>
-        <td class="${i.c5_lowest != null && i.c5_lowest <= i.c5_target ? "up" : ""}">${num(i.c5_lowest)}</td>
-        <td>${num(i.c5_target)}</td>
+        <td class="${i.c5_lowest != null && i.c5_target != null && i.c5_lowest <= i.c5_target ? "up" : ""}">${num(i.c5_lowest)}</td>
+        <td>${num(i.c5_target)}${targetSub}</td>
         <td>${int(i.sell_count)}</td>
         <td>${num(i.purchase_max)}</td>
         <td>${num(i.steam_lowest)}${steamSub}</td>
         <td>${num(i.steam_net)}</td>
         <td class="${zheCls(i.discount_at_lowest)}">${zhe(i.discount_at_lowest)}</td>
+        <td class="${zheCls(i.discount_at_lowest)}">${num(i.rate_at_lowest)}</td>
         <td class="${zheCls(i.discount_at_target)}">${zhe(i.discount_at_target)}</td>
         <td>${i.bought} / ${i.max_qty}</td>
         <td>${num(i.spent)}${spendCap}</td>
@@ -143,7 +172,7 @@
     $("#items").innerHTML = `<table>
       <thead><tr>
         <th class="l">箱子</th><th class="l">状态</th><th>C5 最低</th><th>目标价</th><th>在售</th><th>求购最高</th>
-        <th>Steam 最低</th><th>净到手</th><th>折(C5最低)</th><th>折(目标价)</th><th>已买</th><th>已花</th>
+        <th>Steam 最低</th><th>净到手</th><th>折(C5最低)</th><th title="按 C5 最低价买入，1 美元 Steam 余额花多少人民币">汇率(C5最低)</th><th>折(目标价)</th><th>已买</th><th>已花</th>
       </tr></thead><tbody>${rows.join("")}</tbody></table>`;
   }
 
@@ -183,6 +212,16 @@
   $("#btn-steam").addEventListener("click", () => post("/api/steam/refresh"));
   $("#btn-reload").addEventListener("click", () => post("/api/watchlist/reload"));
   $("#btn-orders").addEventListener("click", () => post("/api/orders/refresh"));
+  $("#rate-form").addEventListener("submit", (e) => {
+    e.preventDefault();
+    const v = $("#rate-input").value.trim();
+    if (!v) { alert("先填目标汇率，比如 5.20"); return; }
+    $("#rate-input").blur();
+    post("/api/rate", { rate: Number(v) });
+  });
+  $("#rate-clear").addEventListener("click", () => {
+    if (confirm("清除目标汇率？之后目标价用 watchlist 里的 max_price。")) post("/api/rate", { rate: null });
+  });
 
   const root = document.documentElement;
   const savedTheme = localStorage.getItem("theme");

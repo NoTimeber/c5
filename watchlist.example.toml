@@ -8,6 +8,7 @@ asset_type = 1      # 1 普通在售 / 2 冷却期在售
 
 # 下面的 max_price 是按 2026-10-02 的 Steam 价按 7 折余额倒推的示例（Steam 最低价扣完手续费 × 0.7）。
 # 先跑 `uv run python -m c5bot compare` 看当天的价再定。
+# 在看板上设了“目标汇率”之后，目标价会按 Steam 价自动算，这里的 max_price 不再使用（max_qty / max_spend 照常）。
 
 [[items]]
 name = "Kilowatt Case"      # 千瓦武器箱。Steam 市场英文名（marketHashName），必须完全一致

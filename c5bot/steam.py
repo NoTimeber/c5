@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import requests
 
 PRICE_OVERVIEW = "https://steamcommunity.com/market/priceoverview/"
+USD = 1                 # Steam 币种编号：1 美元，23 人民币
 STEAM_FEE_PCT = 5       # Steam 交易手续费 5%
 GAME_FEE_PCT = 10       # CS2 游戏手续费 10%
 MIN_INTERVAL = 3.0      # 未登录状态大约每分钟 20 次，再快就 429
@@ -66,12 +67,14 @@ class SteamMarket:
         self._timeout = timeout
         self._last = 0.0
 
-    def price(self, app_id: int, name: str) -> SteamPrice:
+    def price(self, app_id: int, name: str, *, currency: int | None = None) -> SteamPrice:
+        """当前最低挂单价等。currency 不传用初始化时的币种（默认人民币），传 USD 查美元价。"""
         for attempt in (1, 2):
             self._throttle()
             try:
                 resp = self._http.get(PRICE_OVERVIEW, timeout=self._timeout, params={
-                    "appid": app_id, "currency": self._currency, "market_hash_name": name})
+                    "appid": app_id, "currency": self._currency if currency is None else currency,
+                    "market_hash_name": name})
             except requests.RequestException as e:
                 raise SteamError(f"Steam 网络错误: {type(e).__name__}") from None
             if resp.status_code != 429:
