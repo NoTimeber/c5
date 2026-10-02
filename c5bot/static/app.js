@@ -84,6 +84,7 @@
     const s = state;
     $("#mode-badge").innerHTML = badge(s.mode === "live" ? "实盘" : "模拟", `mode-${s.mode}`);
     $("#strategy").textContent = s.strategy === "quick" ? "快速购买" : "在售列表";
+    $("#version").textContent = s.version ? `v${s.version}` : "-";
     $("#run-badge").innerHTML = s.cycle.done ? badge("已完成", "done") : s.paused ? badge("已暂停扫货", "paused") : badge("扫货中", "running");
     const c = s.cycle;
     $("#cycle-text").textContent = c.at ? `第 ${c.n} 轮 · ${ago(c.at)}` : "等待第一轮…";

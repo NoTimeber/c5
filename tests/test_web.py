@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
+from c5bot import __version__
 from c5bot.compare import SteamRate
 from c5bot.config import Settings, WatchItem
 from c5bot.steam import USD, SteamError, SteamPrice
@@ -31,6 +32,7 @@ def test_state_before_first_cycle(env):
     dash, sweeper, client, web = env
     st = web.get("/api/state").json()
     assert st["mode"] == "dry" and st["paused"] is False and st["cycle"]["n"] == 0
+    assert st["version"] == __version__
     assert [i["status"] for i in st["items"]] == ["unknown", "unknown"]
 
 

@@ -149,7 +149,17 @@ curl -sSL https://raw.githubusercontent.com/你的账号/c5/main/deploy/install.
 
 其它子命令：`check`（用同一套镜像和配置跑一次连通性检查）、`status`、`logs`、`restart`（改了 `.env` 后用）、`stop`。可用环境变量：`C5BOT_DIR`（安装目录）、`C5BOT_IMAGE`（换注册表）、`C5BOT_BRANCH`。
 
-回滚：`.env` 里把 `C5BOT_IMAGE` 的 `latest` 换成 Actions 日志里的 `sha-xxxxxxx`，再跑 `upgrade`。
+回滚：`.env` 里把 `C5BOT_IMAGE` 的 `latest` 换成版本号（如 `0.1.0`）或 Actions 日志里的 `sha-xxxxxxx`，再跑 `upgrade`。
+
+### 发版
+
+版本号在 [c5bot/__init__.py](c5bot/__init__.py) 和 `pyproject.toml` 里（测试会检查两边一致），看板头部和启动日志都会显示，`python -m c5bot --version` 也能看。改动记在 [CHANGELOG.md](CHANGELOG.md)。发版：
+
+```bash
+git tag v0.2.0 && git push origin main --tags
+```
+
+Actions 会在 `latest` 之外多推一个 `ghcr.io/notimeber/c5bot:0.2.0`。
 
 想完全自动（不登服务器）：跑一个 [watchtower](https://containrrr.dev/watchtower/) 容器，它定时检查注册表有没有新的 `latest` 并自动重建：
 

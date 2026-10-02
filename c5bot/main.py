@@ -9,6 +9,7 @@ import time
 import unicodedata
 from datetime import datetime
 
+from . import __version__
 from .client import C5Client, C5Error
 from .compare import SteamRate, append_csv, c5_lowest, compare_row, fetch_steam_rate
 from .config import Settings, WatchItem, load_settings, load_watchlist
@@ -159,8 +160,8 @@ def cmd_run(s: Settings, logs: LogBuffer, start_paused: bool) -> int:
     sweeper = Sweeper(s, items, make_client(s), store)
     start_paused = start_paused or s.start_paused
     sweeper.paused = start_paused
-    log.info("启动：模式 %s，策略 %s，轮询 %.1fs，总预算 %s，监控 %d 个饰品%s",
-             s.mode, s.strategy, s.poll_interval, s.max_total_spend or "不限", len(items),
+    log.info("启动 c5bot %s：模式 %s，策略 %s，轮询 %.1fs，总预算 %s，监控 %d 个饰品%s",
+             __version__, s.mode, s.strategy, s.poll_interval, s.max_total_spend or "不限", len(items),
              "，先暂停扫货只看行情" if start_paused else "")
     totals = store.totals(s.mode)
     for it in items:
@@ -247,6 +248,7 @@ def main(argv: list[str] | None = None) -> int:
         stream.reconfigure(encoding="utf-8", errors="replace")
 
     parser = argparse.ArgumentParser(prog="c5bot", description="C5GAME 武器箱监控扫货")
+    parser.add_argument("--version", action="version", version=f"c5bot {__version__}")
     sub = parser.add_subparsers(dest="cmd", required=True)
     sub.add_parser("check", help="检查连通性、app-key、余额、Steam 账号状态")
     sub.add_parser("prices", help="查一次监控列表的当前行情")

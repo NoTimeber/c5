@@ -21,6 +21,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from . import __version__
 from .client import C5Client, C5Error
 from .compare import (
     SteamRate,
@@ -250,7 +251,7 @@ class Dashboard:
                 "steam_at": steam.get("at"), "steam_error": steam.get("error"),
             })
         return {
-            "now": now, "started_at": self.started_at,
+            "now": now, "started_at": self.started_at, "version": __version__,
             "mode": self.s.mode, "strategy": self.s.strategy, "paused": sw.paused,
             "poll_interval": self.s.poll_interval, "steam_refresh_sec": self.s.steam_refresh_sec,
             "cycle": {"n": self.cycle_n, "at": self.cycle_at, "error": self.cycle_error,

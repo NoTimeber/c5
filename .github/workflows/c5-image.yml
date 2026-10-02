@@ -1,4 +1,4 @@
-# 推到 main 时构建镜像推到注册表。服务器上 docker compose pull 就能拿到。
+# 推到 main 时构建镜像推到注册表（latest + sha-xxxxxxx），推 v* 标签时再推一个版本号标签。服务器上 docker compose pull 就能拿到。
 #
 # 默认推到 GHCR：ghcr.io/<你的账号>/c5bot，不用配任何 secret。
 # 服务器在国内拉不动 ghcr.io 的话，改推阿里云容器镜像服务：在仓库 Settings -> Secrets and variables -> Actions 里设
@@ -9,6 +9,7 @@ name: c5 image
 on:
   push:
     branches: [main]
+    tags: ["v*"]   # 打 v0.2.0 这样的标签会多推一个 0.2.0 标签的镜像，方便按版本回滚
   workflow_dispatch:
 
 jobs:
@@ -35,8 +36,9 @@ jobs:
         with:
           images: ${{ vars.C5_IMAGE || format('ghcr.io/{0}/c5bot', github.repository_owner) }}
           tags: |
-            type=raw,value=latest
+            type=raw,value=latest,enable={{is_default_branch}}
             type=sha,format=short
+            type=semver,pattern={{version}}
 
       - name: 构建并推送
         uses: docker/build-push-action@v6
