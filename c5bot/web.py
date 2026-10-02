@@ -40,13 +40,15 @@ from .steam import (
     SteamError,
     SteamLoginRequired,
     SteamMarket,
+    SteamRateLimited,
     check_proxy_url,
     fmt_wait,
     mask_proxy,
     probe_proxy,
     sell_price_from_history,
 )
-from .steam_login import GUARD_NAMES, SteamAuth, SteamLoginError, SteamSession, load_session, renew, save_session
+from .steam_login import GUARD_NAMES, SteamAuth, SteamLoginError, renew
+from .steam_pool import COOLDOWN_SEC, SteamPool
 from .store import Store
 from .sweeper import Sweeper
 
@@ -56,9 +58,9 @@ BALANCE_REFRESH_SEC = 60.0
 RATE_REFRESH_SEC = 3600.0       # Steam 汇率多久重新量一次：它一天也变不了多少，少打两次 Steam
 MANUAL_REFRESH_MIN_SEC = 60.0   # 看板上手动“刷新 Steam 价”的最小间隔
 STEAM_STALE_FACTOR = 3          # Steam 价超过这么多个刷新周期没更新，按汇率算目标价时当作没有
-ACCESS_RENEW_BEFORE_SEC = 3600.0  # Steam access token 剩不到 1 小时就用 refresh token 续
 SETTINGS_FILE = "dashboard.json"
-SESSION_FILE = "steam_session.json"
+SESSIONS_FILE = "steam_sessions.json"       # Steam 账号池（只有令牌，没有密码）
+LEGACY_SESSION_FILE = "steam_session.json"  # 0.3.x 的单账号文件，启动时并进账号池
 RATE_MIN, RATE_MAX = 0.1, 100.0  # 目标汇率合法范围（人民币 / 1 美元）
 
 
@@ -82,7 +84,6 @@ class Dashboard:
         self._store_path = store_path
         self._watchlist_path = watchlist_path or ROOT / "watchlist.toml"
         self._settings_path = settings.data_dir / SETTINGS_FILE
-        self._session_path = settings.data_dir / SESSION_FILE
         self.started_at = time.time()
         self.cycle_n = 0
         self.cycle_at: float | None = None
@@ -104,11 +105,14 @@ class Dashboard:
         self._client = C5Client(settings.app_key, proxy=settings.proxy, timeout=settings.timeout)
         self._refresh_now = threading.Event()
         self._stop = threading.Event()
-        self.steam_session: SteamSession | None = load_session(self._session_path)
+        self.pool = SteamPool(settings.data_dir / SESSIONS_FILE, timeout=settings.timeout)
+        legacy = settings.data_dir / LEGACY_SESSION_FILE
+        if legacy.exists():     # 0.3.x 的单账号文件：并进账号池后删掉
+            for acc in SteamPool(legacy, timeout=settings.timeout).accounts:
+                self.pool.add(acc.session)
+            legacy.unlink(missing_ok=True)
         self.steam_login_error: str | None = None
         self._auth: SteamAuth | None = None      # 进行中的 Steam 登录
-        if self.steam_session:
-            self._steam.set_login(self.steam_session.cookie)
         self._apply_targets()
 
     # ---------- 后台线程 ----------
@@ -141,7 +145,7 @@ class Dashboard:
         self.steam_busy = True
         try:
             items = list(self.sweeper.items)
-            use_history = self._ensure_session()
+            use_history = bool(self.pool.usable())
             self._refresh_rate()  # 先量汇率：美元区账号的成交历史要靠它换算成人民币
             fresh: list[tuple] = []
             if self._steam.blocked_for > 0:
@@ -179,19 +183,34 @@ class Dashboard:
             self.steam_busy = False
 
     def _refresh_history(self, it, sp) -> bool:
-        """拉一个饰品的成交历史，算挂单价。返回登录态还能不能继续用。"""
+        """拉一个饰品的成交历史，算挂单价。账号池里轮着取账号：被限流的歇一会儿、登录态失效的标出来，换下一个。
+        返回还有没有可用账号（没有就不再给后面的饰品拉历史）。"""
         old = self.history.get(it.name) or {"sell": None, "sell_usd": None, "volume": None, "total": None,
                                             "high": None, "share": None, "at": None}
-        try:
-            hist = self._steam.price_history(it.app_id, it.name)
-        except SteamLoginRequired as e:
-            self.history[it.name] = {**old, "error": str(e)}
-            log.warning("Steam 成交历史 %s: %s", it.name, e)
-            return self._session_rejected(str(e))
-        except SteamError as e:
-            self.history[it.name] = {**old, "error": str(e)}
-            log.warning("Steam 成交历史 %s: %s", it.name, e)
-            return True
+        hist = None
+        for _ in range(max(1, len(self.pool))):
+            acc = self.pool.pick()
+            if acc is None:
+                break
+            sess = acc.session
+            try:
+                hist = self._steam.price_history(it.app_id, it.name, steamid=sess.steamid, cookie=sess.cookie)
+                break
+            except SteamLoginRequired as e:
+                log.warning("Steam 成交历史 %s（账号 %s）: %s", it.name, sess.account, e)
+                self.pool.rejected(sess.steamid, str(e))
+                self._steam.drop_login(sess.steamid)
+            except SteamRateLimited as e:
+                log.warning("Steam 成交历史 %s（账号 %s）: %s，这个账号歇 %s", it.name, sess.account, e, fmt_wait(COOLDOWN_SEC))
+                self.pool.cooldown(sess.steamid, str(e))
+            except SteamError as e:
+                self.history[it.name] = {**old, "error": str(e)}
+                log.warning("Steam 成交历史 %s: %s", it.name, e)
+                return True
+        if hist is None:
+            usable = bool(self.pool.usable())
+            self.history[it.name] = {**old, "error": "账号都在歇，下轮再试" if usable else "没有可用的 Steam 账号，请重新登录"}
+            return usable
         sell = sell_price_from_history(hist.points, self.s.steam_sell_window_days, share=self.s.steam_sell_volume_share)
         if sell is None:
             self.history[it.name] = {**old, "error": f"最近 {self.s.steam_sell_window_days:g} 天没有成交记录"}
@@ -279,64 +298,31 @@ class Dashboard:
         if not sess.access_token:
             sess = renew(sess, timeout=self.s.timeout)
         self._auth = None
-        self._set_session(sess)
-        log.info("Steam 已登录：%s，挂单价改按最近 %g 天成交历史算（累计 %.0f%% 成交量的价）",
-                 sess.account, self.s.steam_sell_window_days, self.s.steam_sell_volume_share * 100)
+        self.steam_login_error = None
+        self.pool.add(sess)
+        log.info("Steam 已登录：%s（账号池 %d 个，查成交历史轮流用），挂单价按最近 %g 天成交历史算（累计 %.0f%% 成交量的价）",
+                 sess.account, len(self.pool), self.s.steam_sell_window_days, self.s.steam_sell_volume_share * 100)
         self.request_steam_refresh()
         return True
 
     def steam_login_cancel(self) -> None:
         self._auth = None
 
-    def steam_logout(self) -> None:
+    def steam_logout(self, steamid: str | None = None) -> None:
+        """退出一个账号；不传 steamid 全部退出。"""
         self._auth = None
-        self._set_session(None)
-        self.history = {}
+        if steamid:
+            acc = self.pool.get(steamid)
+            self.pool.remove(steamid)
+            self._steam.drop_login(steamid)
+            log.info("Steam 账号 %s 已退出（账号池剩 %d 个）", acc.session.account if acc else steamid, len(self.pool))
+        else:
+            self.pool.clear()
+            self._steam.drop_login()
+            log.info("Steam 已全部退出登录，挂单价改按当前最低价算")
+        if not self.pool.accounts:
+            self.history = {}
         self._apply_targets()
-        log.info("Steam 已退出登录，挂单价改按当前最低价算")
-
-    def _set_session(self, sess: SteamSession | None) -> None:
-        self.steam_session = sess
-        self.steam_login_error = None
-        self._steam.set_login(sess.cookie if sess else None)
-        save_session(self._session_path, sess)
-
-    def _ensure_session(self) -> bool:
-        """有登录态就确保 access token 没过期，快过期就用 refresh token 续。返回现在能不能用登录态。"""
-        sess = self.steam_session
-        if not sess:
-            return False
-        now = time.time()
-        if sess.refresh_exp and sess.refresh_exp <= now:
-            self._set_session(None)
-            self.steam_login_error = "Steam 登录已过期，请重新登录"
-            log.warning("Steam 登录态过期，请在看板上重新登录")
-            return False
-        if sess.access_exp - now > ACCESS_RENEW_BEFORE_SEC:
-            return True
-        try:
-            self._set_session(renew(sess, timeout=self.s.timeout))
-            log.info("Steam 登录态已续期（%s）", sess.account)
-            return True
-        except SteamLoginError as e:
-            self.steam_login_error = f"续期失败: {e}"
-            log.warning("Steam 登录态续期失败: %s", e)
-            return sess.access_exp > now
-
-    def _session_rejected(self, reason: str) -> bool:
-        """Steam 不认当前 access token：续一次，不行就清掉登录态。返回续成功没有。"""
-        sess = self.steam_session
-        if sess:
-            try:
-                self._set_session(renew(sess, timeout=self.s.timeout))
-                log.info("Steam 登录态已续期（%s）", sess.account)
-                return True
-            except SteamLoginError as e:
-                reason = f"{reason}（续期失败: {e}）"
-        self._set_session(None)
-        self.steam_login_error = reason
-        log.warning("Steam 登录态失效: %s", reason)
-        return False
 
     # ---------- 看板设置（data/dashboard.json） ----------
 
@@ -501,8 +487,8 @@ class Dashboard:
                 "max_qty": it.max_qty, "max_spend": it.max_spend, "bought": qty, "spent": spent,
                 "steam_at": steam.get("at"), "steam_error": steam.get("error"),
             })
-        sess = self.steam_session
         auth = self._auth
+        accounts = self.pool.status()
         return {
             "now": now, "started_at": self.started_at, "version": __version__,
             "mode": self.s.mode, "strategy": self.s.strategy, "paused": sw.paused,
@@ -518,9 +504,8 @@ class Dashboard:
             "steam": {"at": self.steam_at, "busy": self.steam_busy, "blocked_for": self.steam_blocked_for},
             "proxy": {"active": mask_proxy(self.effective_proxy), "source": self.proxy_source,
                       "exit_ip": self.proxy_exit_ip},
-            "steam_login": {"account": sess.account if sess else None, "steamid": sess.steamid if sess else None,
-                            "access_exp": sess.access_exp if sess else None,
-                            "refresh_exp": sess.refresh_exp if sess else None,
+            "steam_accounts": accounts,
+            "steam_login": {"count": len(accounts), "usable": len(self.pool.usable()),
                             "error": self.steam_login_error, "pending": auth is not None,
                             "guard": [GUARD_NAMES[g] for g in auth.guards] if auth else []},
             "rate": {"target": self.target_rate, "discount": self.discount(),
@@ -665,9 +650,11 @@ def create_app(dash: Dashboard) -> FastAPI:
         return JSONResponse({"ok": True})
 
     @app.post("/api/steam/logout")
-    async def steam_logout() -> JSONResponse:
-        dash.steam_logout()
-        return JSONResponse({"ok": True})
+    async def steam_logout(request: Request) -> JSONResponse:
+        """body: {"steamid": "..."} 退出一个账号；不传或空 body 全部退出。"""
+        steamid = (await _json_body(request)).get("steamid")
+        dash.steam_logout(str(steamid) if steamid else None)
+        return JSONResponse({"ok": True, "count": len(dash.pool)})
 
     return app
 

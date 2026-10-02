@@ -37,6 +37,10 @@ class SteamLoginRequired(SteamError):
     """接口要登录，而当前没有登录态或登录态失效。"""
 
 
+class SteamRateLimited(SteamError):
+    """被 Steam 429 / 403。成交历史请求不触发全局退避，由账号池让这个账号歇一会儿。"""
+
+
 @dataclass(frozen=True)
 class SteamPrice:
     lowest: float | None    # 当前最低挂单价
@@ -174,37 +178,40 @@ def probe_proxy(proxy: str, timeout: float = 15.0) -> str:
 class SteamMarket:
     def __init__(self, *, proxy: str | None = None, currency: int = 23, timeout: float = 10.0,
                  clock=time.monotonic):
-        # 两个会话：行情用匿名的，成交历史用带登录 cookie 的。登录 cookie 只发给必须登录的接口，
+        self.proxy: str | None = proxy or None
+        # 匿名会话查行情、汇率；每个 Steam 账号一个带登录 cookie 的会话查成交历史。登录 cookie 只发给必须登录的接口，
         # 实测带着 cookie 查行情会被 Steam 按账号限流，匿名反而没事
-        self._http = self._session()
-        self._auth_http = self._session()
+        self._http = self._new_session()
+        self._login_http: dict[str, requests.Session] = {}
         self._currency = currency
         self._timeout = timeout
         self._now = clock
         self._last = 0.0
         self._blocked_until = 0.0       # 被限流后这个时间之前不再请求
-        self.logged_in = False
-        self.proxy: str | None = None
         self.set_proxy(proxy)
 
-    @staticmethod
-    def _session() -> requests.Session:
+    def _new_session(self) -> requests.Session:
         s = requests.Session()
         s.headers["User-Agent"] = USER_AGENT
         # 实测 Accept-Encoding 里只要有 br，Steam 就直接回 429；requests 装了 brotli 后默认会带上
         s.headers["Accept-Encoding"] = "gzip, deflate"
+        self._apply_proxy(s)
         return s
+
+    def _apply_proxy(self, s: requests.Session) -> None:
+        proxy = self.proxy
+        s.proxies = {"http": proxy, "https": proxy} if proxy else {}
+        # 轮转代理按“新连接换出口 IP”：长连接复用会让一整轮请求都走同一个出口，所以走代理时每个请求都新建连接
+        if proxy:
+            s.headers["Connection"] = "close"
+        else:
+            s.headers.pop("Connection", None)
 
     def set_proxy(self, proxy: str | None) -> None:
         """切换 / 清除代理（看板上改了代理时调用）。换了出口 IP，限流退避状态一并重置。"""
         self.proxy = proxy or None
-        for s in (self._http, self._auth_http):
-            s.proxies = {"http": proxy, "https": proxy} if proxy else {}
-            # 轮转代理按“新连接换出口 IP”：长连接复用会让一整轮请求都走同一个出口，所以走代理时每个请求都新建连接
-            if proxy:
-                s.headers["Connection"] = "close"
-            else:
-                s.headers.pop("Connection", None)
+        for s in (self._http, *self._login_http.values()):
+            self._apply_proxy(s)
         self._interval = MIN_INTERVAL_PROXY if proxy else MIN_INTERVAL
         self._block_base = BLOCK_SEC_PROXY if proxy else BLOCK_SEC
         self._block_sec = self._block_base  # 下次被限流退避多久，连续被限流翻倍
@@ -215,19 +222,23 @@ class SteamMarket:
         """还要等多少秒才会再请求 Steam；0 = 没被限流。"""
         return max(0.0, self._blocked_until - self._now())
 
-    def set_login(self, cookie: str | None) -> None:
-        """设置 / 清除 steamLoginSecure（看板登录后由 Dashboard 调用）。只给成交历史那个会话用。"""
-        try:
-            self._auth_http.cookies.clear(domain="steamcommunity.com", path="/", name="steamLoginSecure")
-        except KeyError:
-            pass
-        if cookie:
-            self._auth_http.cookies.set("steamLoginSecure", cookie, domain="steamcommunity.com", path="/")
-        self.logged_in = bool(cookie)
+    @property
+    def logins(self) -> list[str]:
+        """已经建了会话的账号 steamid。"""
+        return list(self._login_http)
 
-    def _get(self, url: str, params: dict, *, http: requests.Session | None = None) -> requests.Response:
-        """带限流退避的 GET。被 Steam 限流（429 / 403）后 BLOCK_SEC 内直接抛 SteamError、不发请求；
-        连续被限流退避时间翻倍。被限流后继续请求只会把封锁拖长，所以不做逐个重试。"""
+    def drop_login(self, steamid: str | None = None) -> None:
+        """账号退出登录：丢掉它的会话；不传 steamid 全部丢掉。"""
+        if steamid is None:
+            self._login_http.clear()
+        else:
+            self._login_http.pop(steamid, None)
+
+    def _get(self, url: str, params: dict, *, http: requests.Session | None = None,
+             block: bool = True) -> requests.Response:
+        """带限流退避的 GET。被 Steam 限流（429 / 403）后抛 SteamRateLimited；block=True 时还会在 BLOCK_SEC 内
+        拒绝后续请求（连续被限流退避翻倍），被限流后继续请求只会把封锁拖长。成交历史请求 block=False，
+        由账号池让那个账号歇一会儿，不影响别的账号和行情。"""
         wait = self.blocked_for
         if wait > 0:
             raise SteamError(f"Steam 限流中，{fmt_wait(wait)}后再试")
@@ -243,10 +254,12 @@ class SteamMarket:
                 return resp
             if attempt < attempts:
                 log.info("Steam %s，换一个代理出口重试（%d/%d）", resp.status_code, attempt, attempts)
-        block = self._block_sec
-        self._blocked_until = self._now() + block
-        self._block_sec = min(block * 2, BLOCK_MAX_SEC)
-        raise SteamError(f"Steam 限流（{resp.status_code}），{fmt_wait(block)}内不再请求 Steam")
+        if not block:
+            raise SteamRateLimited(f"Steam 限流（{resp.status_code}）")
+        sec = self._block_sec
+        self._blocked_until = self._now() + sec
+        self._block_sec = min(sec * 2, BLOCK_MAX_SEC)
+        raise SteamRateLimited(f"Steam 限流（{resp.status_code}），{fmt_wait(sec)}内不再请求 Steam")
 
     def price(self, app_id: int, name: str, *, currency: int | None = None) -> SteamPrice:
         """当前最低挂单价等。currency 不传用初始化时的币种（默认人民币），传 USD 查美元价。"""
@@ -264,11 +277,14 @@ class SteamMarket:
                           median=parse_money(data.get("median_price")),
                           volume=int(volume) if volume else None)
 
-    def price_history(self, app_id: int, name: str) -> PriceHistory:
-        """成交历史（市场页那张图的数据）。要登录；没登录或登录态失效时 Steam 回 400 + 空数组。"""
-        if not self.logged_in:
-            raise SteamLoginRequired("查成交历史要先在看板上登录 Steam")
-        resp = self._get(PRICE_HISTORY, {"appid": app_id, "market_hash_name": name}, http=self._auth_http)
+    def price_history(self, app_id: int, name: str, *, steamid: str, cookie: str) -> PriceHistory:
+        """成交历史（市场页那张图的数据）。用指定账号的登录 cookie 查；登录态失效时 Steam 回 400 + 空数组。
+        每个账号一个会话（各自的 cookie 罐），被 429 不触发全局退避，交给账号池处理。"""
+        http = self._login_http.get(steamid)
+        if http is None:
+            http = self._login_http[steamid] = self._new_session()
+        http.cookies.set("steamLoginSecure", cookie, domain="steamcommunity.com", path="/")
+        resp = self._get(PRICE_HISTORY, {"appid": app_id, "market_hash_name": name}, http=http, block=False)
         try:
             data = resp.json()
         except ValueError:

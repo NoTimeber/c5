@@ -51,14 +51,15 @@
   <section class="card" id="steam-card">
     <div class="card-head">
       <h2>Steam 账号 <span class="muted" id="steam-sub"></span></h2>
-      <div class="actions"><button class="ghost danger" id="steam-logout" type="button" hidden>退出登录</button></div>
+      <div class="actions"><button class="ghost danger" id="steam-logout" type="button" hidden>全部退出</button></div>
     </div>
     <div class="muted" id="steam-status">-</div>
+    <div class="table-wrap" id="steam-accounts"></div>
     <form class="login-form" id="steam-login-form" hidden>
       <input id="steam-account" type="text" autocomplete="username" placeholder="Steam 账号名" required>
       <input id="steam-password" type="password" autocomplete="current-password" placeholder="密码" required>
       <button class="ghost primary" type="submit">登录</button>
-      <span class="muted">密码只用来向 Steam 换登录令牌，不保存；令牌存在服务器 data/ 目录里，自动续期。</span>
+      <span class="muted">密码只用来向 Steam 换登录令牌，不保存；令牌存在服务器 data/ 目录里，自动续期。可以多登几个号组成账号池。</span>
     </form>
     <form class="login-form" id="steam-guard-form" hidden>
       <span id="steam-guard-hint" class="muted"></span>

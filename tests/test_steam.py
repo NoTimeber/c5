@@ -12,6 +12,7 @@ from c5bot.steam import (
     SteamError,
     SteamLoginRequired,
     SteamMarket,
+    SteamRateLimited,
     check_proxy_url,
     discount,
     fmt_wait,
@@ -78,7 +79,7 @@ def test_proxy_shortens_interval_and_backoff():
     assert (direct._interval, direct._block_sec) == (MIN_INTERVAL, BLOCK_SEC)
     assert (via._interval, via._block_sec) == (MIN_INTERVAL_PROXY, BLOCK_SEC_PROXY)
     assert via._http.proxies == {"http": "http://u:p@proxy.example.com:1337", "https": "http://u:p@proxy.example.com:1337"}
-    assert via._auth_http.proxies == via._http.proxies
+    assert via._new_session().proxies == via._http.proxies      # 后建的账号会话也带代理
     # 运行时切换：换了出口，限流状态重置
     direct._blocked_until = direct._now() + 100
     direct.set_proxy("socks5://proxy.example.com:1080")
@@ -192,12 +193,10 @@ def test_sell_price_from_history_by_volume_share():
     assert sell_price_from_history([], 3, now) is None
 
 
-def test_price_history_requires_login_and_parses(monkeypatch):
+def test_price_history_per_account_sessions(monkeypatch):
     m = SteamMarket()
     monkeypatch.setattr(m, "_throttle", lambda: None)
-    with pytest.raises(SteamLoginRequired):
-        m.price_history(730, "Kilowatt Case")
-
+    http = m._login_http["7656"] = m._new_session()
     seen = {}
 
     class Resp:
@@ -213,21 +212,37 @@ def test_price_history_requires_login_and_parses(monkeypatch):
         Resp(400, [])])
 
     def fake_get(url, *, timeout, params):
-        seen["cookie"] = m._auth_http.cookies.get("steamLoginSecure", domain="steamcommunity.com")
+        seen["cookie"] = http.cookies.get("steamLoginSecure", domain="steamcommunity.com")
         seen["params"] = params
         return next(replies)
-    monkeypatch.setattr(m._auth_http, "get", fake_get)
-    m.set_login("7656%7C%7Ctoken")
-    hist = m.price_history(730, "Kilowatt Case")
+    monkeypatch.setattr(http, "get", fake_get)
+    hist = m.price_history(730, "Kilowatt Case", steamid="7656", cookie="7656%7C%7Ctoken")
     assert seen["cookie"] == "7656%7C%7Ctoken" and seen["params"]["market_hash_name"] == "Kilowatt Case"
     assert [(p.price, p.volume) for p in hist.points] == [(1.08, 3514), (1.1, 12)]
     assert hist.prefix == "¥ " and not hist.usd
     # 美元区账号：前缀是 $
-    assert m.price_history(730, "Kilowatt Case").usd
-    # 行情那个会话始终不带登录 cookie
+    assert m.price_history(730, "Kilowatt Case", steamid="7656", cookie="7656%7C%7Ctoken").usd
+    # 行情那个会话始终不带登录 cookie；每个账号各自的会话
     assert m._http.cookies.get("steamLoginSecure", domain="steamcommunity.com") is None
+    assert m.logins == ["7656"]
     # 登录态失效：Steam 回 400 + []
     with pytest.raises(SteamLoginRequired, match="失效"):
-        m.price_history(730, "Kilowatt Case")
-    m.set_login(None)
-    assert m._auth_http.cookies.get("steamLoginSecure", domain="steamcommunity.com") is None and not m.logged_in
+        m.price_history(730, "Kilowatt Case", steamid="7656", cookie="7656%7C%7Ctoken")
+    m.drop_login("7656")
+    assert m.logins == []
+
+
+def test_history_429_does_not_block_globally(monkeypatch):
+    m = SteamMarket()
+    monkeypatch.setattr(m, "_throttle", lambda: None)
+    http = m._login_http["a"] = m._new_session()
+
+    class Resp:
+        status_code = 429
+
+        def json(self):
+            return None
+    monkeypatch.setattr(http, "get", lambda url, *, timeout, params: Resp())
+    with pytest.raises(SteamRateLimited):
+        m.price_history(730, "x", steamid="a", cookie="c")
+    assert m.blocked_for == 0        # 由账号池让这个账号歇着，行情和别的账号不受影响

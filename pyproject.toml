@@ -1,6 +1,6 @@
 [project]
 name = "c5-case-sweeper"
-version = "0.4.1"
+version = "0.5.0"
 description = "C5GAME 开放平台武器箱行情监控 + 扫货"
 requires-python = ">=3.12"
 dependencies = [

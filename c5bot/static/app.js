@@ -224,13 +224,12 @@
   }
   function renderSteam() {
     const sl = state.steam_login || {};
+    const accounts = state.steam_accounts || [];
     const form = $("#steam-login-form"), guard = $("#steam-guard-form"), status = $("#steam-status"), logout = $("#steam-logout");
-    $("#steam-sub").textContent = sl.account ? "挂单价按成交历史" : "挂单价按最低价";
-    if (sl.account) {
-      status.innerHTML = `已登录 <b>${esc(sl.account)}</b>。挂单价按最近 ${state.sell_window_days} 天成交历史算：有 ${Math.round(state.sell_volume_share * 100)}% 的成交在此价或更高价成交，净到手、折扣、目标价都按它算。` +
-        `登录态自动续期，最晚到 ${fmtDate(sl.refresh_exp)} 需要重新登录。` + (sl.error ? ` <span class="down">${esc(sl.error)}</span>` : "");
-      form.hidden = true; guard.hidden = true; logout.hidden = false;
-    } else if (sl.pending) {
+    const pct = Math.round((state.sell_volume_share || 0.3) * 100);
+    $("#steam-sub").textContent = accounts.length ? `账号池 ${accounts.length} 个，可用 ${sl.usable}` : "挂单价按最低价";
+    logout.hidden = !accounts.length;
+    if (sl.pending) {
       const g = sl.guard || [];
       const needCode = g.includes("device_code") || g.includes("email");
       $("#steam-code").hidden = !needCode;
@@ -238,14 +237,25 @@
       $("#steam-guard-hint").textContent = g.includes("device_code") ? "输入 Steam 手机令牌上的验证码，或直接在手机 Steam App 上点确认"
         : g.includes("email") ? "输入发到邮箱的验证码" : "请在 Steam 手机 App 上点确认";
       status.textContent = "等待验证…";
-      form.hidden = true; guard.hidden = false; logout.hidden = true;
+      form.hidden = true; guard.hidden = false;
       if (!pollTimer) pollTimer = setInterval(pollLogin, 3000);
     } else {
-      status.innerHTML = (sl.error ? `<span class="down">${esc(sl.error)}</span> ` : "") +
-        "未登录：挂单价按当前最低挂单价算。登录后按最近几天的成交历史算（能大批量卖出的价），更接近挂单卖出的实际到手。用一个没有库存和余额的小号即可。";
-      form.hidden = false; guard.hidden = true; logout.hidden = true;
+      const err = sl.error ? `<span class="down">${esc(sl.error)}</span> ` : "";
+      status.innerHTML = accounts.length
+        ? `${err}已登录 ${accounts.length} 个账号，查成交历史时轮流用，每个请求同时换代理出口。挂单价按最近 ${state.sell_window_days} 天成交历史算：有 ${pct}% 的成交在此价或更高价成交。被限流的账号自动歇 10 分钟，标“需重新登录”的要在下面重新登一次。继续添加账号：`
+        : `${err}未登录：挂单价按当前最低挂单价算。登录后按最近几天的成交历史算（能大批量卖出的价），更接近挂单卖出的实际到手。可以登多个账号轮着用，用没有库存和余额的小号即可。`;
+      form.hidden = false; guard.hidden = true;
     }
     if (!sl.pending && pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+    $("#steam-accounts").innerHTML = accounts.length ? `<table>
+      <thead><tr><th class="l">账号</th><th class="l">状态</th><th>登录态到期</th><th>成交历史请求</th><th>最近使用</th><th></th></tr></thead>
+      <tbody>${accounts.map((a) => {
+        const st = a.dead ? badge("需重新登录", "fail") : a.cooldown_for > 0 ? badge(`歇 ${Math.ceil(a.cooldown_for / 60)} 分钟`, "warn") : a.error ? badge("有警告", "warn") : badge("正常", "ok");
+        const note = a.error ? `<div class="sub-cell" title="${esc(a.error)}">${esc(a.error.slice(0, 40))}</div>` : "";
+        return `<tr><td class="l"><b>${esc(a.account)}</b><div class="sub-cell">${esc(a.steamid)}</div></td><td class="l">${st}${note}</td>
+          <td>${fmtDate(a.refresh_exp)}</td><td>${int(a.requests)}</td><td>${a.last_used ? ago(a.last_used) : "-"}</td>
+          <td><button class="ghost danger" type="button" data-steamid="${esc(a.steamid)}" data-account="${esc(a.account)}">退出</button></td></tr>`;
+      }).join("")}</tbody></table>` : "";
     renderProxy();
   }
 
@@ -329,7 +339,12 @@
     if (confirm("清除看板上设置的 Steam 代理？之后回退到 .env 里的配置（没有就直连）。")) post("/api/proxy", { proxy: null });
   });
   $("#steam-logout").addEventListener("click", () => {
-    if (confirm("退出 Steam 登录？之后挂单价按当前最低价算。")) post("/api/steam/logout");
+    if (confirm("退出全部 Steam 账号？之后挂单价按当前最低价算。")) post("/api/steam/logout", {});
+  });
+  $("#steam-accounts").addEventListener("click", (e) => {
+    const btn = e.target.closest("button[data-steamid]");
+    if (!btn) return;
+    if (confirm(`退出账号 ${btn.dataset.account}？`)) post("/api/steam/logout", { steamid: btn.dataset.steamid });
   });
 
   const root = document.documentElement;

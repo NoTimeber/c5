@@ -3,7 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import time
-from dataclasses import replace
+from dataclasses import asdict, replace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 from c5bot import __version__
 from c5bot.compare import SteamRate
 from c5bot.config import Settings, WatchItem
-from c5bot.steam import USD, HistoryPoint, PriceHistory, SteamError, SteamLoginRequired, SteamPrice
+from c5bot.steam import USD, HistoryPoint, PriceHistory, SteamError, SteamLoginRequired, SteamPrice, SteamRateLimited
 from c5bot.steam_login import SteamLoginError, SteamSession
 from c5bot.store import Store
 from c5bot.sweeper import Sweeper
@@ -276,20 +276,22 @@ def test_manual_refresh_throttled(env):
     assert web.post("/api/steam/refresh").json() == {"ok": True}
 
 
-# ---------- Steam 登录与挂单价 ----------
+# ---------- Steam 登录与挂单价（账号池） ----------
 
 class FakeAuth:
-    """替代 SteamAuth：begin 要验证码，guard 后 poll 成功。"""
+    """替代 SteamAuth：begin 要验证码，guard 后 poll 成功。steamid 由账号名生成，方便登多个。"""
     instances: list = []
 
     def __init__(self, *, proxy=None, timeout=15.0):
         self.guards = [4, 3]
         self.steps: list = []
         self.done = False
+        self.account = ""
         FakeAuth.instances.append(self)
 
     def begin(self, account, password):
         self.steps.append(("begin", account, password))
+        self.account = account
         if password == "wrong":
             raise SteamLoginError("密码错误")
         return ["device_confirmation", "device_code"]
@@ -302,10 +304,25 @@ class FakeAuth:
 
     def poll(self):
         self.steps.append(("poll",))
-        return session() if self.done else None
+        return SteamSession(f"7656-{self.account}", self.account, jwt(4.1e9), jwt(4e9)) if self.done else None
 
 
-def test_steam_login_flow_persists_session(env, tmp_path, monkeypatch):
+def login(web, account):
+    assert web.post("/api/steam/login", json={"account": account, "password": "pw"}).json()["ok"]
+    assert web.post("/api/steam/guard", json={"code": "12345"}).json() == {"ok": True, "logged_in": True}
+
+
+def fake_history_factory(history, calls):
+    def fake_history(app_id, name, *, steamid, cookie):
+        calls.append(("history", name, steamid))
+        r = history[name]
+        if isinstance(r, Exception):
+            raise r
+        return r
+    return fake_history
+
+
+def test_steam_login_flow_builds_account_pool(env, tmp_path, monkeypatch):
     dash, sweeper, client, web = env
     monkeypatch.setattr("c5bot.web.SteamAuth", FakeAuth)
     assert web.post("/api/steam/login", json={"account": "", "password": ""}).status_code == 400
@@ -315,31 +332,40 @@ def test_steam_login_flow_persists_session(env, tmp_path, monkeypatch):
     r = web.post("/api/steam/login", json={"account": "me", "password": "pw"})
     assert r.json() == {"ok": True, "logged_in": False, "guard": ["device_confirmation", "device_code"]}
     st = web.get("/api/state").json()["steam_login"]
-    assert st["pending"] is True and st["account"] is None and st["guard"] == ["device_confirmation", "device_code"]
+    assert st["pending"] is True and st["count"] == 0 and st["guard"] == ["device_confirmation", "device_code"]
     # 手机上还没确认
     assert web.post("/api/steam/login/poll").json() == {"ok": True, "logged_in": False}
     r = web.post("/api/steam/guard", json={"code": "00000"})
     assert r.status_code == 400 and "令牌" in r.json()["error"]
     assert web.post("/api/steam/guard", json={"code": "12345"}).json() == {"ok": True, "logged_in": True}
-    st = web.get("/api/state").json()["steam_login"]
-    assert st["account"] == "me" and st["pending"] is False and st["refresh_exp"] == 4.1e9
-    assert json.loads((tmp_path / "steam_session.json").read_text(encoding="utf-8"))["account"] == "me"
-    assert dash._steam.logged_in
+    login(web, "me2")
+    st = web.get("/api/state").json()
+    assert st["steam_login"]["count"] == 2 and st["steam_login"]["usable"] == 2 and st["steam_login"]["pending"] is False
+    assert [a["account"] for a in st["steam_accounts"]] == ["me", "me2"]
+    saved = json.loads((tmp_path / "steam_sessions.json").read_text(encoding="utf-8"))
+    assert [d["account"] for d in saved] == ["me", "me2"]
     # 密码没有进日志
     assert not any("pw" in l["msg"] for l in dash.logs.lines)
+    # 同一个账号再登一次：替换，不重复
+    login(web, "me")
+    assert len(dash.pool) == 2
+    # 退出一个
+    assert web.post("/api/steam/logout", json={"steamid": "7656-me"}).json() == {"ok": True, "count": 1}
+    assert [a["account"] for a in web.get("/api/state").json()["steam_accounts"]] == ["me2"]
+    # 全部退出
+    assert web.post("/api/steam/logout", json={}).json() == {"ok": True, "count": 0}
+    assert not (tmp_path / "steam_sessions.json").exists() and dash._steam.logins == []
 
-    assert web.post("/api/steam/logout").json() == {"ok": True}
-    assert not (tmp_path / "steam_session.json").exists() and not dash._steam.logged_in
-    assert web.get("/api/state").json()["steam_login"]["account"] is None
 
-
-def test_session_loaded_at_start(tmp_path):
-    from c5bot.steam_login import save_session
-    save_session(tmp_path / "steam_session.json", session())
+def test_pool_loaded_at_start_and_legacy_file_migrated(tmp_path):
+    (tmp_path / "steam_session.json").write_text(json.dumps(asdict(session())), encoding="utf-8")
     s = Settings(app_key="k", mode="dry", data_dir=tmp_path)
     sweeper = Sweeper(s, [CASE], FakeClient(), Store(tmp_path / "t.sqlite"), clock=Clock())
     dash = Dashboard(s, sweeper, tmp_path / "t.sqlite", LogBuffer())
-    assert dash.steam_session.account == "me" and dash._steam.logged_in
+    assert [a.session.account for a in dash.pool.accounts] == ["me"]
+    assert not (tmp_path / "steam_session.json").exists() and (tmp_path / "steam_sessions.json").exists()
+    dash2 = Dashboard(s, sweeper, tmp_path / "t.sqlite", LogBuffer())
+    assert len(dash2.pool) == 1
 
 
 def test_refresh_uses_history_sell_price_when_logged_in(env, monkeypatch):
@@ -356,12 +382,8 @@ def test_refresh_uses_history_sell_price_when_logged_in(env, monkeypatch):
     def fake_price(app_id, name, *, currency=None):
         calls.append(("price", name, currency))
         return SteamPrice(36.05, 37.0, 93) if currency == USD else prices[name]
-
-    def fake_history(app_id, name):
-        calls.append(("history", name))
-        return history[name]
     monkeypatch.setattr(dash._steam, "price", fake_price)
-    monkeypatch.setattr(dash._steam, "price_history", fake_history)
+    monkeypatch.setattr(dash._steam, "price_history", fake_history_factory(history, calls))
 
     # 没登录：不拉历史，挂单价 = 最低价
     dash.refresh_steam()
@@ -369,11 +391,11 @@ def test_refresh_uses_history_sell_price_when_logged_in(env, monkeypatch):
     kilo = web.get("/api/state").json()["items"][0]
     assert kilo["sell_src"] == "lowest" and kilo["steam_sell"] == 1.17
 
-    # 登录后：挂单价 = 3 天内最高小时中位价 1.30，净到手和目标价都按它算
-    dash._set_session(session())
+    # 登录后：挂单价 = 累计 30% 成交量的价 1.30，净到手和目标价都按它算
+    dash.pool.add(session())
     dash.set_target_rate(5.0)
     dash.refresh_steam()
-    assert [c[1] for c in calls if c[0] == "history"] == [CASE.name, OTHER.name]
+    assert [(c[1], c[2]) for c in calls if c[0] == "history"] == [(CASE.name, "7656"), (OTHER.name, "7656")]
     st = web.get("/api/state").json()
     kilo, rev = st["items"]
     assert kilo["sell_src"] == "history" and kilo["steam_sell"] == 1.30
@@ -392,9 +414,39 @@ def test_refresh_uses_history_sell_price_when_logged_in(env, monkeypatch):
     assert kilo["sell_src"] == "history" and kilo["steam_sell"] == round(0.19 * rate, 2) and kilo["sell_usd"] == 0.19
 
     # 退出登录：回到最低价
-    web.post("/api/steam/logout")
+    web.post("/api/steam/logout", json={})
     assert web.get("/api/state").json()["items"][0]["sell_src"] == "lowest"
     assert sweeper.auto_targets[CASE.name] == int(1.02 * disc * 100 + 1e-9) / 100
+
+
+def test_pool_rotates_accounts_and_cools_down_rate_limited_one(env, monkeypatch):
+    dash, sweeper, client, web = env
+    now = time.time()
+    for i in (1, 2, 3):
+        dash.pool.add(SteamSession(f"id{i}", f"acc{i}", jwt(4.1e9), jwt(4e9)))
+    monkeypatch.setattr(dash._steam, "price", lambda app_id, name, **kw: SteamPrice(1.17, 1.15, 80000))
+    calls = []
+
+    def fake_history(app_id, name, *, steamid, cookie):
+        calls.append(steamid)
+        if steamid == "id2":
+            raise SteamRateLimited("Steam 限流（429）")
+        return PriceHistory([HistoryPoint(now - 3600, 1.30, 2000)], "¥ ")
+    monkeypatch.setattr(dash._steam, "price_history", fake_history)
+    dash.refresh_steam()
+    # 两个箱子：第一个用 acc1；第二个轮到 acc2 被 429 -> acc2 歇着，换 acc3 成功
+    assert calls == ["id1", "id2", "id3"]
+    st = web.get("/api/state").json()
+    accounts = {a["account"]: a for a in st["steam_accounts"]}
+    assert accounts["acc2"]["cooldown_for"] > 0 and "429" in accounts["acc2"]["error"]
+    assert accounts["acc1"]["requests"] == 1 and accounts["acc3"]["requests"] == 1
+    assert st["steam"]["blocked_for"] == 0          # 账号被限流不触发全局退避
+    assert all(i["sell_src"] == "history" for i in st["items"])
+    assert st["steam_login"] == {"count": 3, "usable": 2, "error": None, "pending": False, "guard": []}
+    # 下一轮：acc2 歇着跳过，acc1 / acc3 轮流
+    calls.clear()
+    dash.refresh_steam()
+    assert calls == ["id1", "id3"]
 
 
 def test_usd_wallet_mode(tmp_path, monkeypatch):
@@ -414,8 +466,8 @@ def test_usd_wallet_mode(tmp_path, monkeypatch):
     monkeypatch.setattr(dash._steam, "price", fake_price)
     now = time.time()
     monkeypatch.setattr(dash._steam, "price_history",
-                        lambda app_id, name: PriceHistory([HistoryPoint(now - 3600, 0.181, 9035)], "$"))
-    dash._set_session(session())
+                        lambda app_id, name, *, steamid, cookie: PriceHistory([HistoryPoint(now - 3600, 0.181, 9035)], "$"))
+    dash.pool.add(session())
     dash.set_target_rate(5.2)
     dash.refresh_steam()
     assert calls == [(CASE.name, None)]          # 不量 Steam 汇率
@@ -433,44 +485,51 @@ def test_usd_wallet_mode(tmp_path, monkeypatch):
     assert kilo["status"] == "hit" and len(st["purchases"]) == 1
 
 
-def test_access_token_renewed_before_expiry(env, monkeypatch):
+def test_access_token_renewed_before_use(env, monkeypatch):
     dash, sweeper, client, web = env
-    dash._set_session(session(access_exp=time.time() + 600))   # 10 分钟后过期
+    dash.pool.add(session(access_exp=time.time() + 600))   # 10 分钟后过期
     renewed = session(access_exp=time.time() + 86400)
-    monkeypatch.setattr("c5bot.web.renew", lambda sess, **kw: renewed)
+    monkeypatch.setattr("c5bot.steam_login.renew", lambda sess, **kw: renewed)
     monkeypatch.setattr(dash._steam, "price", lambda app_id, name, **kw: SteamPrice(1.17, 1.15, 1))
-    monkeypatch.setattr(dash._steam, "price_history", lambda app_id, name: PriceHistory([]))
+    seen = []
+
+    def fake_history(app_id, name, *, steamid, cookie):
+        seen.append(cookie)
+        return PriceHistory([])
+    monkeypatch.setattr(dash._steam, "price_history", fake_history)
     dash.refresh_steam()
-    assert dash.steam_session.access_token == renewed.access_token
-    assert dash._steam._auth_http.cookies.get("steamLoginSecure", domain="steamcommunity.com") == renewed.cookie
+    assert dash.pool.accounts[0].session.access_token == renewed.access_token
+    assert seen and seen[0] == renewed.cookie        # 用的是续期后的 cookie
 
 
-def test_rejected_session_is_dropped_when_renew_fails(env, monkeypatch):
+def test_rejected_account_is_marked_dead_when_renew_fails(env, monkeypatch):
     dash, sweeper, client, web = env
-    dash._set_session(session())
+    dash.pool.add(session())
     monkeypatch.setattr(dash._steam, "price", lambda app_id, name, **kw: SteamPrice(1.17, 1.15, 1))
     hist_calls = []
 
-    def rejected(app_id, name):
+    def rejected(app_id, name, *, steamid, cookie):
         hist_calls.append(name)
         raise SteamLoginRequired("Steam 登录态失效，请在看板上重新登录")
     monkeypatch.setattr(dash._steam, "price_history", rejected)
 
     def dead(sess, **kw):
         raise SteamLoginError("Steam 不再接受这个登录态")
-    monkeypatch.setattr("c5bot.web.renew", dead)
+    monkeypatch.setattr("c5bot.steam_login.renew", dead)
     dash.refresh_steam()
-    assert hist_calls == [CASE.name]          # 第一个饰品失败后不再拉历史
-    st = web.get("/api/state").json()["steam_login"]
-    assert st["account"] is None and "失效" in st["error"]
-    assert not dash._steam.logged_in
+    assert hist_calls == [CASE.name]          # 唯一的账号废了，第二个箱子不再拉历史
+    st = web.get("/api/state").json()
+    acc = st["steam_accounts"][0]
+    assert acc["dead"] is True and "失效" in acc["error"] and st["steam_login"]["usable"] == 0
+    assert "没有可用的 Steam 账号" in st["items"][0]["history_error"]
+    assert dash._steam.logins == []
 
 
-def test_expired_refresh_token_requires_relogin(env):
+def test_expired_refresh_token_marks_account(env):
     dash, sweeper, client, web = env
-    dash._set_session(session(access_exp=time.time() - 10, refresh_exp=time.time() - 5))
-    assert dash._ensure_session() is False
-    assert dash.steam_session is None and "过期" in dash.steam_login_error
+    dash.pool.add(session(access_exp=time.time() - 10, refresh_exp=time.time() - 5))
+    assert dash.pool.usable() == [] and dash.pool.pick() is None
+    assert dash.pool.accounts[0].dead and "过期" in dash.pool.accounts[0].error
 
 
 def test_reload_watchlist_recomputes_targets(env, tmp_path):
