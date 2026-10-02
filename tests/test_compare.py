@@ -44,7 +44,18 @@ def test_append_csv_writes_header_once(tmp_path):
     assert rows[0][:3] == ["time", "name", "c5_lowest"]
     assert len(rows) == 3
     assert rows[1] == ["2026-09-30 10:00:00", "Kilowatt Case", "0.75", "0.7", "1.17", "1.02",
-                       str(round(0.75 / 1.02, 4)), str(round(0.7 / 1.02, 4)), "1.15", "80000", "", "", ""]
+                       str(round(0.75 / 1.02, 4)), str(round(0.7 / 1.02, 4)), "1.15", "80000", "", "", "", "1.17"]
+
+
+def test_compare_row_with_sell_price_basis():
+    # 挂 1.30 卖（成交历史里的高价）而不是最低价 1.17：净到手 1.14，折扣按它算
+    r = compare_row(CASE, 0.75, SteamPrice(1.17, 1.15, 80000), sell=1.30)
+    assert r.steam_lowest == 1.17 and r.steam_sell == 1.30
+    assert r.steam_net == pytest.approx(1.14)
+    assert r.discount_at_lowest == pytest.approx(0.75 / 1.14)
+    assert r.discount_at_target == pytest.approx(0.70 / 1.14)
+    # 没传 sell 就按最低价
+    assert compare_row(CASE, 0.75, SteamPrice(1.17, 1.15, 80000)).steam_sell == 1.17
 
 
 # ---------- 汇率 ----------

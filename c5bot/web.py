@@ -2,7 +2,7 @@
 
 扫货循环在主线程，看板在一个守护线程里；两边通过 Dashboard 共享状态。
 Steam 价和余额由 Dashboard 自己的后台线程刷新，不占用扫货循环。
-看板上设的目标汇率存在 data/dashboard.json，重启不丢。
+看板上设的目标汇率存在 data/dashboard.json，Steam 登录态存在 data/steam_session.json，重启都不丢。
 """
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ from typing import Any
 
 import uvicorn
 from fastapi import FastAPI, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -33,7 +34,8 @@ from .compare import (
     target_price,
 )
 from .config import ROOT, Settings, load_watchlist
-from .steam import SteamError, SteamMarket, SteamPrice, fmt_wait
+from .steam import SteamError, SteamLoginRequired, SteamMarket, fmt_wait, sell_price_from_history
+from .steam_login import GUARD_NAMES, SteamAuth, SteamLoginError, SteamSession, load_session, renew, save_session
 from .store import Store
 from .sweeper import Sweeper
 
@@ -43,7 +45,9 @@ BALANCE_REFRESH_SEC = 60.0
 RATE_REFRESH_SEC = 3600.0       # Steam 汇率多久重新量一次：它一天也变不了多少，少打两次 Steam
 MANUAL_REFRESH_MIN_SEC = 60.0   # 看板上手动“刷新 Steam 价”的最小间隔
 STEAM_STALE_FACTOR = 3          # Steam 价超过这么多个刷新周期没更新，按汇率算目标价时当作没有
+ACCESS_RENEW_BEFORE_SEC = 3600.0  # Steam access token 剩不到 1 小时就用 refresh token 续
 SETTINGS_FILE = "dashboard.json"
+SESSION_FILE = "steam_session.json"
 RATE_MIN, RATE_MAX = 0.1, 100.0  # 目标汇率合法范围（人民币 / 1 美元）
 
 
@@ -67,6 +71,7 @@ class Dashboard:
         self._store_path = store_path
         self._watchlist_path = watchlist_path or ROOT / "watchlist.toml"
         self._settings_path = settings.data_dir / SETTINGS_FILE
+        self._session_path = settings.data_dir / SESSION_FILE
         self.started_at = time.time()
         self.cycle_n = 0
         self.cycle_at: float | None = None
@@ -74,6 +79,7 @@ class Dashboard:
         self.balance: float | None = None
         self.balance_at: float | None = None
         self.steam: dict[str, dict] = {}        # 饰品名 -> {price, at, error}
+        self.history: dict[str, dict] = {}      # 饰品名 -> {sell, volume, sell_at, at, error}（登录后的挂单价）
         self.steam_at: float | None = None
         self.steam_busy = False
         self.steam_rate: SteamRate | None = None    # Steam 内部人民币/美元换算率
@@ -84,6 +90,11 @@ class Dashboard:
         self._refresh_now = threading.Event()
         self._stop = threading.Event()
         self.target_rate: float | None = self._load_target_rate()
+        self.steam_session: SteamSession | None = load_session(self._session_path)
+        self.steam_login_error: str | None = None
+        self._auth: SteamAuth | None = None      # 进行中的 Steam 登录
+        if self.steam_session:
+            self._steam.set_login(self.steam_session.cookie)
         self._apply_targets()
 
     # ---------- 后台线程 ----------
@@ -112,10 +123,11 @@ class Dashboard:
             self._refresh_now.clear()
 
     def refresh_steam(self) -> None:
-        """拉一遍所有饰品的 Steam 价和 Steam 汇率，重算目标价，顺手把对比行追加到 compare.csv。"""
+        """拉一遍所有饰品的 Steam 价（登录后还有成交历史）和 Steam 汇率，重算目标价，顺手把对比行追加到 compare.csv。"""
         self.steam_busy = True
         try:
             items = list(self.sweeper.items)
+            use_history = self._ensure_session()
             fresh: list[tuple] = []
             for it in items:
                 if self._stop.is_set():
@@ -131,21 +143,48 @@ class Dashboard:
                     if self._steam.blocked_for > 0:
                         log.warning("Steam 限流，本轮剩下的饰品先跳过，沿用上次的价")
                         break
+                    continue
+                if use_history:
+                    use_history = self._refresh_history(it, sp)
+                    if self._steam.blocked_for > 0:
+                        log.warning("Steam 限流，本轮剩下的饰品先跳过，沿用上次的价")
+                        break
             self._refresh_rate()
             self.steam_at = time.time()
             self._apply_targets()
             stats = self.sweeper.view.get("stats") or {}
             rate = self.steam_rate.rate if self.steam_rate else None
-            rows = [compare_row(it, c5_lowest(stats.get(it.name)), sp, target=self.sweeper.target(it), rate=rate)
+            rows = [compare_row(it, c5_lowest(stats.get(it.name)), sp, target=self.sweeper.target(it), rate=rate,
+                                sell=self.sell_basis(it)[0])
                     for it, sp in fresh]
             append_csv(self.s.data_dir / "compare.csv", datetime.now().strftime("%Y-%m-%d %H:%M:%S"), rows)
         finally:
             self.steam_busy = False
 
-    @property
-    def steam_blocked_for(self) -> float:
-        """被 Steam 限流时还要等多少秒，0 = 正常。"""
-        return self._steam.blocked_for
+    def _refresh_history(self, it, sp) -> bool:
+        """拉一个饰品的成交历史，算挂单价。返回登录态还能不能继续用。"""
+        old = self.history.get(it.name) or {"sell": None, "volume": None, "sell_at": None, "at": None}
+        try:
+            points = self._steam.price_history(it.app_id, it.name)
+        except SteamLoginRequired as e:
+            self.history[it.name] = {**old, "error": str(e)}
+            log.warning("Steam 成交历史 %s: %s", it.name, e)
+            return self._session_rejected(str(e))
+        except SteamError as e:
+            self.history[it.name] = {**old, "error": str(e)}
+            log.warning("Steam 成交历史 %s: %s", it.name, e)
+            return True
+        sell = sell_price_from_history(points, self.s.steam_sell_window_days)
+        if sell is None:
+            self.history[it.name] = {**old, "error": f"最近 {self.s.steam_sell_window_days:g} 天没有成交记录"}
+            return True
+        # 历史价和当前中位价差太多，多半是登录账号的钱包币种和 STEAM_CURRENCY 不一致，这种价不能用
+        if sp.median and not 0.5 <= sell.price / sp.median <= 3:
+            self.history[it.name] = {**old, "error": "成交历史的币种和 STEAM_CURRENCY 对不上，检查登录账号的钱包区"}
+            log.warning("Steam 成交历史 %s: 历史价 %.2f 和当前中位价 %.2f 对不上，疑似币种不一致", it.name, sell.price, sp.median)
+            return True
+        self.history[it.name] = {"sell": sell.price, "volume": sell.volume, "sell_at": sell.ts, "at": time.time(), "error": None}
+        return True
 
     def _refresh_rate(self) -> None:
         """用参照饰品查人民币价和美元价算 Steam 汇率，最多每 RATE_REFRESH_SEC 量一次。失败就沿用上次的值。"""
@@ -168,6 +207,99 @@ class Dashboard:
             except C5Error as e:
                 log.warning("查余额失败: %s", e)
             self._stop.wait(BALANCE_REFRESH_SEC)
+
+    # ---------- Steam 登录 ----------
+
+    @property
+    def steam_blocked_for(self) -> float:
+        """被 Steam 限流时还要等多少秒，0 = 正常。"""
+        return self._steam.blocked_for
+
+    def steam_login_begin(self, account: str, password: str) -> dict:
+        """提交账号密码。返回 {logged_in, guard}；guard 非空表示还要验证码或手机确认。"""
+        auth = SteamAuth(proxy=self.s.steam_proxy, timeout=self.s.timeout)
+        guards = auth.begin(account, password)
+        self._auth = auth
+        self.steam_login_error = None
+        if not guards:
+            return {"logged_in": self.steam_login_poll(), "guard": []}
+        return {"logged_in": False, "guard": guards}
+
+    def steam_login_guard(self, code: str) -> bool:
+        auth = self._auth
+        if auth is None:
+            raise SteamLoginError("先提交账号密码")
+        auth.guard(code)
+        return self.steam_login_poll()
+
+    def steam_login_poll(self) -> bool:
+        """登录完成了返回 True；还在等验证返回 False。"""
+        auth = self._auth
+        if auth is None:
+            raise SteamLoginError("没有进行中的登录")
+        sess = auth.poll()
+        if sess is None:
+            return False
+        if not sess.access_token:
+            sess = renew(sess, proxy=self.s.steam_proxy, timeout=self.s.timeout)
+        self._auth = None
+        self._set_session(sess)
+        log.info("Steam 已登录：%s，挂单价改按最近 %g 天成交历史算", sess.account, self.s.steam_sell_window_days)
+        self.request_steam_refresh()
+        return True
+
+    def steam_login_cancel(self) -> None:
+        self._auth = None
+
+    def steam_logout(self) -> None:
+        self._auth = None
+        self._set_session(None)
+        self.history = {}
+        self._apply_targets()
+        log.info("Steam 已退出登录，挂单价改按当前最低价算")
+
+    def _set_session(self, sess: SteamSession | None) -> None:
+        self.steam_session = sess
+        self.steam_login_error = None
+        self._steam.set_login(sess.cookie if sess else None)
+        save_session(self._session_path, sess)
+
+    def _ensure_session(self) -> bool:
+        """有登录态就确保 access token 没过期，快过期就用 refresh token 续。返回现在能不能用登录态。"""
+        sess = self.steam_session
+        if not sess:
+            return False
+        now = time.time()
+        if sess.refresh_exp and sess.refresh_exp <= now:
+            self._set_session(None)
+            self.steam_login_error = "Steam 登录已过期，请重新登录"
+            log.warning("Steam 登录态过期，请在看板上重新登录")
+            return False
+        if sess.access_exp - now > ACCESS_RENEW_BEFORE_SEC:
+            return True
+        try:
+            self._set_session(renew(sess, proxy=self.s.steam_proxy, timeout=self.s.timeout))
+            log.info("Steam 登录态已续期（%s）", sess.account)
+            return True
+        except SteamLoginError as e:
+            self.steam_login_error = f"续期失败: {e}"
+            log.warning("Steam 登录态续期失败: %s", e)
+            return sess.access_exp > now
+
+    def _session_rejected(self, reason: str) -> bool:
+        """Steam 不认当前 access token：续一次，不行就清掉登录态。返回续成功没有。"""
+        sess = self.steam_session
+        if sess:
+            try:
+                self._set_session(renew(sess, proxy=self.s.steam_proxy, timeout=self.s.timeout))
+                log.info("Steam 登录态已续期（%s）", sess.account)
+                return True
+            except SteamLoginError as e:
+                reason = f"{reason}（续期失败: {e}）"
+        self._set_session(None)
+        self.steam_login_error = reason
+        log.warning("Steam 登录态失效: %s", reason)
+        return False
 
     # ---------- 目标汇率 ----------
 
@@ -194,6 +326,17 @@ class Dashboard:
         """目标汇率对应的折扣。"""
         return rate_discount(self.target_rate, self.steam_rate.rate if self.steam_rate else None)
 
+    def sell_basis(self, it) -> tuple[float | None, str]:
+        """算净到手用的 Steam 卖出价：登录后用成交历史里的挂单价（新鲜的），否则用当前最低挂单价。"""
+        stale_after = STEAM_STALE_FACTOR * self.s.steam_refresh_sec
+        now = time.time()
+        h = self.history.get(it.name) or {}
+        if h.get("sell") and h.get("at") and now - h["at"] <= stale_after:
+            return h["sell"], "history"
+        st = self.steam.get(it.name) or {}
+        sp = st.get("price")
+        return (sp.lowest if sp else None), "lowest"
+
     def _apply_targets(self) -> None:
         """按目标汇率给每个饰品算目标价，交给扫货线程。没设汇率就交 None，扫货用 watchlist 的 max_price。"""
         if self.target_rate is None:
@@ -204,11 +347,12 @@ class Dashboard:
         stale_after = STEAM_STALE_FACTOR * self.s.steam_refresh_sec
         targets: dict[str, float | None] = {}
         for it in self.sweeper.items:
-            st = self.steam.get(it.name) or {}
-            sp: SteamPrice | None = st.get("price")
-            at = st.get("at")
-            fresh = sp is not None and at is not None and now - at <= stale_after
-            targets[it.name] = target_price(disc, sp.lowest) if fresh and sp else None
+            basis, src = self.sell_basis(it)
+            if src == "lowest":
+                at = (self.steam.get(it.name) or {}).get("at")
+                if not (at and now - at <= stale_after):
+                    basis = None
+            targets[it.name] = target_price(disc, basis)
         self.sweeper.auto_targets = targets
 
     # ---------- 状态 ----------
@@ -242,6 +386,8 @@ class Dashboard:
             t = totals.get(it.name)
             qty, spent = (t.qty, t.spent) if t else (0, 0.0)
             steam = self.steam.get(it.name) or {}
+            h = self.history.get(it.name) or {}
+            basis, src = self.sell_basis(it)
             if qty >= it.max_qty or (it.max_spend and spent >= it.max_spend):
                 status = "done"
             elif pause_until.get(it.name, 0) > now:
@@ -255,17 +401,22 @@ class Dashboard:
             else:
                 status = "watch"
             items.append({
-                **asdict(compare_row(it, c5, steam.get("price"), target=tgt, rate=rate)),
+                **asdict(compare_row(it, c5, steam.get("price"), target=tgt, rate=rate, sell=basis)),
                 "status": status, "pause_until": pause_until.get(it.name),
                 "sell_count": st.get("sellCount"), "purchase_max": st.get("purchaseMaxPrice"),
                 "max_price": it.max_price, "target_auto": auto,
+                "sell_src": src, "sell_volume": h.get("volume"), "sell_at": h.get("sell_at"),
+                "history_error": h.get("error"),
                 "max_qty": it.max_qty, "max_spend": it.max_spend, "bought": qty, "spent": spent,
                 "steam_at": steam.get("at"), "steam_error": steam.get("error"),
             })
+        sess = self.steam_session
+        auth = self._auth
         return {
             "now": now, "started_at": self.started_at, "version": __version__,
             "mode": self.s.mode, "strategy": self.s.strategy, "paused": sw.paused,
             "poll_interval": self.s.poll_interval, "steam_refresh_sec": self.s.steam_refresh_sec,
+            "sell_window_days": self.s.steam_sell_window_days,
             "cycle": {"n": self.cycle_n, "at": self.cycle_at, "error": self.cycle_error,
                       "done": bool(view.get("done"))},
             "budget": {"total": self.s.max_total_spend,
@@ -273,6 +424,11 @@ class Dashboard:
                        "qty": sum(t.qty for t in totals.values())},
             "balance": {"value": self.balance, "at": self.balance_at},
             "steam": {"at": self.steam_at, "busy": self.steam_busy, "blocked_for": self.steam_blocked_for},
+            "steam_login": {"account": sess.account if sess else None, "steamid": sess.steamid if sess else None,
+                            "access_exp": sess.access_exp if sess else None,
+                            "refresh_exp": sess.refresh_exp if sess else None,
+                            "error": self.steam_login_error, "pending": auth is not None,
+                            "guard": [GUARD_NAMES[g] for g in auth.guards] if auth else []},
             "rate": {"target": self.target_rate, "discount": self.discount(),
                      "steam": asdict(self.steam_rate) if self.steam_rate else None,
                      "steam_error": self.steam_rate_error},
@@ -280,6 +436,14 @@ class Dashboard:
             "purchases": [asdict(p) for p in reversed(purchases)],
             "logs": list(self.logs.lines),
         }
+
+
+async def _json_body(request: Request) -> dict:
+    try:
+        body = await request.json()
+    except ValueError:
+        return {}
+    return body if isinstance(body, dict) else {}
 
 
 def create_app(dash: Dashboard) -> FastAPI:
@@ -345,11 +509,7 @@ def create_app(dash: Dashboard) -> FastAPI:
     @app.post("/api/rate")
     async def set_rate(request: Request) -> JSONResponse:
         """body: {"rate": 5.2} 设置目标汇率；{"rate": null} 清除，恢复用 watchlist 的 max_price。"""
-        try:
-            body = await request.json()
-        except ValueError:
-            body = None
-        raw = body.get("rate") if isinstance(body, dict) else None
+        raw = (await _json_body(request)).get("rate")
         if raw in (None, ""):
             dash.set_target_rate(None)
             return JSONResponse({"ok": True, "rate": None})
@@ -362,6 +522,47 @@ def create_app(dash: Dashboard) -> FastAPI:
                                 status_code=400)
         dash.set_target_rate(rate)
         return JSONResponse({"ok": True, "rate": rate})
+
+    # ---- Steam 登录：这几个会去请求 Steam，放线程池里跑，不卡看板 ----
+
+    @app.post("/api/steam/login")
+    async def steam_login(request: Request) -> JSONResponse:
+        body = await _json_body(request)
+        account, password = str(body.get("account") or "").strip(), str(body.get("password") or "")
+        if not account or not password:
+            return JSONResponse({"ok": False, "error": "账号和密码都要填"}, status_code=400)
+        try:
+            result = await run_in_threadpool(dash.steam_login_begin, account, password)
+        except SteamLoginError as e:
+            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+        return JSONResponse({"ok": True, **result})
+
+    @app.post("/api/steam/guard")
+    async def steam_guard(request: Request) -> JSONResponse:
+        code = str((await _json_body(request)).get("code") or "")
+        try:
+            logged_in = await run_in_threadpool(dash.steam_login_guard, code)
+        except SteamLoginError as e:
+            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+        return JSONResponse({"ok": True, "logged_in": logged_in})
+
+    @app.post("/api/steam/login/poll")
+    async def steam_login_poll() -> JSONResponse:
+        try:
+            logged_in = await run_in_threadpool(dash.steam_login_poll)
+        except SteamLoginError as e:
+            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+        return JSONResponse({"ok": True, "logged_in": logged_in})
+
+    @app.post("/api/steam/login/cancel")
+    async def steam_login_cancel() -> JSONResponse:
+        dash.steam_login_cancel()
+        return JSONResponse({"ok": True})
+
+    @app.post("/api/steam/logout")
+    async def steam_logout() -> JSONResponse:
+        dash.steam_logout()
+        return JSONResponse({"ok": True})
 
     return app
 

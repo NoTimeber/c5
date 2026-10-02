@@ -4,10 +4,12 @@ from __future__ import annotations
 import re
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 import requests
 
 PRICE_OVERVIEW = "https://steamcommunity.com/market/priceoverview/"
+PRICE_HISTORY = "https://steamcommunity.com/market/pricehistory/"   # 要登录；币种跟登录账号的钱包走
 USD = 1                 # Steam 币种编号：1 美元，23 人民币
 STEAM_FEE_PCT = 5       # Steam 交易手续费 5%
 GAME_FEE_PCT = 10       # CS2 游戏手续费 10%
@@ -20,6 +22,10 @@ class SteamError(Exception):
     pass
 
 
+class SteamLoginRequired(SteamError):
+    """接口要登录，而当前没有登录态或登录态失效。"""
+
+
 @dataclass(frozen=True)
 class SteamPrice:
     lowest: float | None    # 当前最低挂单价
@@ -27,10 +33,30 @@ class SteamPrice:
     volume: int | None      # 24 小时成交量
 
 
+@dataclass(frozen=True)
+class HistoryPoint:
+    ts: float       # UTC 时间戳；最近一个月按小时，更早按天
+    price: float    # 这一小时成交的中位价，币种是登录账号的钱包币种
+    volume: int
+
+
+@dataclass(frozen=True)
+class SellPrice:
+    price: float    # 窗口内最高的小时中位价：按这个价挂单，最近几天是能成交的
+    volume: int     # 那个小时成交了多少件
+    ts: float       # 那个小时
+
+
 def parse_money(text) -> float | None:
     """'¥ 1,234.56' -> 1234.56。只处理用点作小数点的货币。"""
     m = re.search(r"\d[\d,]*(?:\.\d+)?", str(text or ""))
     return float(m.group().replace(",", "")) if m else None
+
+
+def parse_history_time(text: str) -> float:
+    """成交历史的时间格式 'Oct 01 2026 01: +0'（UTC）-> 时间戳。"""
+    head = text.split(":")[0].strip()
+    return datetime.strptime(head, "%b %d %Y %H").replace(tzinfo=timezone.utc).timestamp()
 
 
 def seller_receives(price: float) -> float:
@@ -56,6 +82,16 @@ def discount(c5_price: float, steam_price: float | None) -> float | None:
     return c5_price / net if net > 0 else None
 
 
+def sell_price_from_history(points: list[HistoryPoint], days: float, now: float | None = None) -> SellPrice | None:
+    """最近 days 天里最高的小时中位价。小时中位价本身是几百上千笔成交的中位数，不会被一两笔异常成交带偏。"""
+    now = time.time() if now is None else now
+    recent = [p for p in points if p.ts >= now - days * 86400 and p.volume > 0 and p.price > 0]
+    if not recent:
+        return None
+    best = max(recent, key=lambda p: (p.price, p.ts))
+    return SellPrice(price=best.price, volume=best.volume, ts=best.ts)
+
+
 def fmt_wait(sec: float) -> str:
     sec = max(1, round(sec))
     return f"{-(-sec // 60)} 分钟" if sec >= 60 else f"{sec} 秒"
@@ -76,24 +112,32 @@ class SteamMarket:
         self._last = 0.0
         self._blocked_until = 0.0       # 被限流后这个时间之前不再请求
         self._block_sec = BLOCK_SEC     # 下次被限流退避多久，连续被限流翻倍
+        self.logged_in = False
 
     @property
     def blocked_for(self) -> float:
         """还要等多少秒才会再请求 Steam；0 = 没被限流。"""
         return max(0.0, self._blocked_until - self._now())
 
-    def price(self, app_id: int, name: str, *, currency: int | None = None) -> SteamPrice:
-        """当前最低挂单价等。currency 不传用初始化时的币种（默认人民币），传 USD 查美元价。
-        被 Steam 限流（429 / 403）后 BLOCK_SEC 内直接抛 SteamError、不发请求；连续被限流退避时间翻倍。
-        被限流后继续请求只会把封锁拖长，所以不做逐个重试。"""
+    def set_login(self, cookie: str | None) -> None:
+        """设置 / 清除 steamLoginSecure（看板登录后由 Dashboard 调用）。"""
+        try:
+            self._http.cookies.clear(domain="steamcommunity.com", path="/", name="steamLoginSecure")
+        except KeyError:
+            pass
+        if cookie:
+            self._http.cookies.set("steamLoginSecure", cookie, domain="steamcommunity.com", path="/")
+        self.logged_in = bool(cookie)
+
+    def _get(self, url: str, params: dict) -> requests.Response:
+        """带限流退避的 GET。被 Steam 限流（429 / 403）后 BLOCK_SEC 内直接抛 SteamError、不发请求；
+        连续被限流退避时间翻倍。被限流后继续请求只会把封锁拖长，所以不做逐个重试。"""
         wait = self.blocked_for
         if wait > 0:
             raise SteamError(f"Steam 限流中，{fmt_wait(wait)}后再试")
         self._throttle()
         try:
-            resp = self._http.get(PRICE_OVERVIEW, timeout=self._timeout, params={
-                "appid": app_id, "currency": self._currency if currency is None else currency,
-                "market_hash_name": name})
+            resp = self._http.get(url, timeout=self._timeout, params=params)
         except requests.RequestException as e:
             raise SteamError(f"Steam 网络错误: {type(e).__name__}") from None
         if resp.status_code in (429, 403):
@@ -102,6 +146,13 @@ class SteamMarket:
             self._block_sec = min(block * 2, BLOCK_MAX_SEC)
             raise SteamError(f"Steam 限流（{resp.status_code}），{fmt_wait(block)}内不再请求 Steam")
         self._block_sec = BLOCK_SEC  # 正常拿到响应就把退避复位
+        return resp
+
+    def price(self, app_id: int, name: str, *, currency: int | None = None) -> SteamPrice:
+        """当前最低挂单价等。currency 不传用初始化时的币种（默认人民币），传 USD 查美元价。"""
+        resp = self._get(PRICE_OVERVIEW, {
+            "appid": app_id, "currency": self._currency if currency is None else currency,
+            "market_hash_name": name})
         try:
             data = resp.json()
         except ValueError:
@@ -112,6 +163,28 @@ class SteamMarket:
         return SteamPrice(lowest=parse_money(data.get("lowest_price")),
                           median=parse_money(data.get("median_price")),
                           volume=int(volume) if volume else None)
+
+    def price_history(self, app_id: int, name: str) -> list[HistoryPoint]:
+        """成交历史（市场页那张图的数据）。要登录；没登录或登录态失效时 Steam 回 400 + 空数组。"""
+        if not self.logged_in:
+            raise SteamLoginRequired("查成交历史要先在看板上登录 Steam")
+        resp = self._get(PRICE_HISTORY, {"appid": app_id, "market_hash_name": name})
+        try:
+            data = resp.json()
+        except ValueError:
+            raise SteamError(f"Steam HTTP {resp.status_code}") from None
+        if resp.status_code == 400 or not isinstance(data, dict) or not data.get("success"):
+            if resp.status_code in (400, 401) or not isinstance(data, dict):
+                raise SteamLoginRequired("Steam 登录态失效，请在看板上重新登录")
+            raise SteamError(f"Steam 没有 {name} 的成交历史")
+        points = []
+        for row in data.get("prices") or []:
+            try:
+                when, price, volume = row
+                points.append(HistoryPoint(parse_history_time(str(when)), float(price), int(float(volume))))
+            except (ValueError, TypeError):
+                continue
+        return points
 
     def _throttle(self) -> None:
         wait = self._last + MIN_INTERVAL - self._now()

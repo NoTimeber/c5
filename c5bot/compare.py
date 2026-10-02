@@ -19,7 +19,7 @@ from .steam import USD, SteamError, SteamMarket, SteamPrice, discount, seller_re
 
 CSV_FIELDS = ["time", "name", "c5_lowest", "c5_target", "steam_lowest", "steam_net",
               "discount_at_lowest", "discount_at_target", "steam_median", "steam_volume",
-              "steam_rate", "rate_at_lowest", "rate_at_target"]
+              "steam_rate", "rate_at_lowest", "rate_at_target", "steam_sell"]
 
 _ITEM_PRICE = object()  # compare_row 的哨兵：目标价用 watchlist 里的 max_price
 
@@ -38,6 +38,7 @@ class CompareRow:
     steam_rate: float | None = None         # Steam 内部人民币/美元换算率
     rate_at_lowest: float | None = None     # 按 C5 最低价买入，1 美元余额花多少人民币
     rate_at_target: float | None = None     # 按目标价买入
+    steam_sell: float | None = None         # 算净到手用的卖出价：登录后是成交历史的挂单价，否则就是 steam_lowest
 
 
 @dataclass(frozen=True)
@@ -90,21 +91,25 @@ def fetch_steam_rate(steam: SteamMarket, name: str, app_id: int = 730) -> SteamR
 
 
 def compare_row(item: WatchItem, c5: float | None, sp: SteamPrice | None, *,
-                target: float | None | object = _ITEM_PRICE, rate: float | None = None) -> CompareRow:
-    """target 不传用 watchlist 的 max_price；传 None 表示按汇率算但还没有 Steam 价。"""
+                target: float | None | object = _ITEM_PRICE, rate: float | None = None,
+                sell: float | None = None) -> CompareRow:
+    """target 不传用 watchlist 的 max_price；传 None 表示按汇率算但还没有 Steam 价。
+    sell 是算净到手用的卖出价（挂单价），不传用 Steam 当前最低挂单价。"""
     lowest = sp.lowest if sp else None
+    basis = sell if sell else lowest
     tgt = item.max_price if target is _ITEM_PRICE else target
-    d_low = discount(c5, lowest) if c5 else None
-    d_tgt = discount(tgt, lowest) if tgt else None
+    d_low = discount(c5, basis) if c5 else None
+    d_tgt = discount(tgt, basis) if tgt else None
     return CompareRow(
         name=item.name, c5_lowest=c5, c5_target=tgt, steam_lowest=lowest,
-        steam_net=seller_receives(lowest) if lowest else None,
+        steam_net=seller_receives(basis) if basis else None,
         discount_at_lowest=d_low, discount_at_target=d_tgt,
         steam_median=sp.median if sp else None,
         steam_volume=sp.volume if sp else None,
         steam_rate=rate,
         rate_at_lowest=d_low * rate if d_low and rate else None,
         rate_at_target=d_tgt * rate if d_tgt and rate else None,
+        steam_sell=basis,
     )
 
 

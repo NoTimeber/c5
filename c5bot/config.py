@@ -46,6 +46,7 @@ class Settings:
     steam_currency: int = 23            # Steam 钱包币种，23 = 人民币
     steam_refresh_sec: float = 600.0    # 看板多久刷新一次 Steam 价
     steam_rate_item: str = STEAM_RATE_ITEM_DEFAULT  # 量 Steam 汇率用的参照饰品（Steam 市场英文名）
+    steam_sell_window_days: float = 3.0  # 登录 Steam 后，挂单价取最近几天成交历史里的最高小时中位价
     ui_host: str = "127.0.0.1"          # 看板监听地址
     ui_port: int = 8766                 # 0 = 不开看板
     start_paused: bool = False          # 启动时先暂停扫货只看行情，等看板上点“继续”
@@ -98,6 +99,7 @@ def load_settings(env_file: Path | None = None) -> Settings:
         steam_currency=int(_float("STEAM_CURRENCY", 23)),
         steam_refresh_sec=_float("STEAM_REFRESH_SEC", 600.0),
         steam_rate_item=(os.getenv("STEAM_RATE_ITEM") or "").strip() or STEAM_RATE_ITEM_DEFAULT,
+        steam_sell_window_days=_float("STEAM_SELL_WINDOW_DAYS", 3.0),
         ui_host=os.getenv("C5_UI_HOST") or "127.0.0.1",
         ui_port=int(_float("C5_UI_PORT", 8766)),
         start_paused=(os.getenv("C5_START_PAUSED") or "").strip().lower() in ("yes", "true", "1"),

@@ -23,13 +23,19 @@
     const sameDay = d.toDateString() === new Date().toDateString();
     return withDate || !sameDay ? `${d.getMonth() + 1}-${pad(d.getDate())} ${t}` : t;
   }
+  function fmtDate(ts) {
+    if (!ts) return "-";
+    const d = new Date(ts * 1000);
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  }
   function ago(ts) {
     if (!ts) return "-";
     const s = Math.max(0, Math.round(Date.now() / 1000 - ts));
     if (s < 5) return "刚刚";
     if (s < 60) return `${s} 秒前`;
     if (s < 3600) return `${Math.floor(s / 60)} 分钟前`;
-    return `${Math.floor(s / 3600)} 小时 ${Math.floor((s % 3600) / 60)} 分前`;
+    if (s < 86400) return `${Math.floor(s / 3600)} 小时 ${Math.floor((s % 3600) / 60)} 分前`;
+    return `${Math.floor(s / 86400)} 天前`;
   }
   function dur(sec) {
     const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60);
@@ -50,6 +56,7 @@
     }
   }
   async function post(url, body) {
+    let j = null;
     try {
       const opts = { method: "POST" };
       if (body !== undefined) {
@@ -57,12 +64,13 @@
         opts.body = JSON.stringify(body);
       }
       const r = await fetch(url, opts);
-      const j = await r.json();
+      j = await r.json();
       if (!j.ok) alert(j.error || "操作失败");
     } catch (e) {
       alert(`请求失败: ${e}`);
     }
     await load();
+    return j;
   }
 
   // ---- 渲染 ----------------------------------------------------------
@@ -76,6 +84,7 @@
     renderKpis();
     renderRateForm();
     renderItems();
+    renderSteam();
     renderPurchases();
     renderLogs();
   }
@@ -157,6 +166,10 @@
       const steamSub = i.steam_error ? `<div class="sub-cell down">${esc(i.steam_error)}</div>` : i.steam_at ? `<div class="sub-cell">${ago(i.steam_at)}</div>` : "";
       const spendCap = i.max_spend ? ` / ${num(i.max_spend)}` : "";
       const targetSub = i.target_auto ? `<div class="sub-cell">${i.c5_target == null ? "等 Steam 价" : "按汇率"}</div>` : "";
+      let sellSub;
+      if (i.sell_src === "history") sellSub = `<div class="sub-cell" title="最近 ${s.sell_window_days} 天成交历史里最高的小时中位价，${fmtTime(i.sell_at, true)} 那小时成交 ${int(i.sell_volume)} 件">${s.sell_window_days} 天最高 · ${int(i.sell_volume)} 件</div>`;
+      else if (i.history_error) sellSub = `<div class="sub-cell down" title="${esc(i.history_error)}">按最低价（历史失败）</div>`;
+      else sellSub = `<div class="sub-cell">按最低价</div>`;
       return `<tr>
         <td class="l"><b>${esc(i.name)}</b></td>
         <td class="l">${badge(text, cls)}${cool}</td>
@@ -165,6 +178,7 @@
         <td>${int(i.sell_count)}</td>
         <td>${num(i.purchase_max)}</td>
         <td>${num(i.steam_lowest)}${steamSub}</td>
+        <td>${num(i.steam_sell)}${sellSub}</td>
         <td>${num(i.steam_net)}</td>
         <td class="${zheCls(i.discount_at_lowest)}">${zhe(i.discount_at_lowest)}</td>
         <td class="${zheCls(i.discount_at_lowest)}">${num(i.rate_at_lowest)}</td>
@@ -176,8 +190,48 @@
     $("#items").innerHTML = `<table>
       <thead><tr>
         <th class="l">箱子</th><th class="l">状态</th><th>C5 最低</th><th>目标价</th><th>在售</th><th>求购最高</th>
-        <th>Steam 最低</th><th>净到手</th><th>折(C5最低)</th><th title="按 C5 最低价买入，1 美元 Steam 余额花多少人民币">汇率(C5最低)</th><th>折(目标价)</th><th>已买</th><th>已花</th>
+        <th>Steam 最低</th><th title="算净到手用的卖出价：登录 Steam 后是最近几天成交历史的最高小时中位价，否则是当前最低挂单价">挂单价</th><th>净到手</th>
+        <th>折(C5最低)</th><th title="按 C5 最低价买入，1 美元 Steam 余额花多少人民币">汇率(C5最低)</th><th>折(目标价)</th><th>已买</th><th>已花</th>
       </tr></thead><tbody>${rows.join("")}</tbody></table>`;
+  }
+
+  // ---- Steam 登录 ----------------------------------------------------
+  let pollTimer = null;
+  async function pollLogin() {
+    try {
+      const r = await fetch("/api/steam/login/poll", { method: "POST" });
+      const j = await r.json();
+      if (!j.ok || j.logged_in) {
+        clearInterval(pollTimer);
+        pollTimer = null;
+        await load();
+      }
+    } catch { /* 下次再试 */ }
+  }
+  function renderSteam() {
+    const sl = state.steam_login || {};
+    const form = $("#steam-login-form"), guard = $("#steam-guard-form"), status = $("#steam-status"), logout = $("#steam-logout");
+    $("#steam-sub").textContent = sl.account ? "挂单价按成交历史" : "挂单价按最低价";
+    if (sl.account) {
+      status.innerHTML = `已登录 <b>${esc(sl.account)}</b>。挂单价取最近 ${state.sell_window_days} 天成交历史里最高的小时中位价，净到手、折扣、目标价都按它算。` +
+        `登录态自动续期，最晚到 ${fmtDate(sl.refresh_exp)} 需要重新登录。` + (sl.error ? ` <span class="down">${esc(sl.error)}</span>` : "");
+      form.hidden = true; guard.hidden = true; logout.hidden = false;
+    } else if (sl.pending) {
+      const g = sl.guard || [];
+      const needCode = g.includes("device_code") || g.includes("email");
+      $("#steam-code").hidden = !needCode;
+      $("#steam-code-btn").hidden = !needCode;
+      $("#steam-guard-hint").textContent = g.includes("device_code") ? "输入 Steam 手机令牌上的验证码，或直接在手机 Steam App 上点确认"
+        : g.includes("email") ? "输入发到邮箱的验证码" : "请在 Steam 手机 App 上点确认";
+      status.textContent = "等待验证…";
+      form.hidden = true; guard.hidden = false; logout.hidden = true;
+      if (!pollTimer) pollTimer = setInterval(pollLogin, 3000);
+    } else {
+      status.innerHTML = (sl.error ? `<span class="down">${esc(sl.error)}</span> ` : "") +
+        "未登录：挂单价按当前最低挂单价算。登录后按最近几天成交历史的最高价算，更接近挂单卖出的实际到手。用一个没有库存和余额的小号即可。";
+      form.hidden = false; guard.hidden = true; logout.hidden = true;
+    }
+    if (!sl.pending && pollTimer) { clearInterval(pollTimer); pollTimer = null; }
   }
 
   function renderPurchases() {
@@ -225,6 +279,23 @@
   });
   $("#rate-clear").addEventListener("click", () => {
     if (confirm("清除目标汇率？之后目标价用 watchlist 里的 max_price。")) post("/api/rate", { rate: null });
+  });
+  $("#steam-login-form").addEventListener("submit", (e) => {
+    e.preventDefault();
+    const account = $("#steam-account").value.trim(), password = $("#steam-password").value;
+    $("#steam-password").value = "";
+    post("/api/steam/login", { account, password });
+  });
+  $("#steam-guard-form").addEventListener("submit", (e) => {
+    e.preventDefault();
+    const code = $("#steam-code").value.trim();
+    if (!code) { alert("先填验证码"); return; }
+    $("#steam-code").value = "";
+    post("/api/steam/guard", { code });
+  });
+  $("#steam-cancel").addEventListener("click", () => post("/api/steam/login/cancel"));
+  $("#steam-logout").addEventListener("click", () => {
+    if (confirm("退出 Steam 登录？之后挂单价按当前最低价算。")) post("/api/steam/logout");
   });
 
   const root = document.documentElement;

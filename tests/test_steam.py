@@ -2,7 +2,20 @@ from __future__ import annotations
 
 import pytest
 
-from c5bot.steam import BLOCK_SEC, USD, SteamError, SteamMarket, discount, fmt_wait, parse_money, seller_receives
+from c5bot.steam import (
+    BLOCK_SEC,
+    USD,
+    HistoryPoint,
+    SteamError,
+    SteamLoginRequired,
+    SteamMarket,
+    discount,
+    fmt_wait,
+    parse_history_time,
+    parse_money,
+    sell_price_from_history,
+    seller_receives,
+)
 
 
 def test_steam_session_never_advertises_brotli():
@@ -94,3 +107,58 @@ def test_429_blocks_further_requests_with_backoff(monkeypatch):
     now[0] += BLOCK_SEC * 2
     assert m.price(730, "Kilowatt Case").lowest == 1.08
     assert m.blocked_for == 0 and m._block_sec == BLOCK_SEC
+
+
+# ---------- 成交历史（登录后） ----------
+
+def test_parse_history_time():
+    assert parse_history_time("Oct 01 2026 01: +0") == 1790816400.0   # 2026-10-01 01:00 UTC
+    assert parse_history_time("Jan 02 2026 00: +0") == 1767312000.0
+
+
+def test_sell_price_from_history_takes_window_max():
+    now = 1790900000.0
+    pts = [HistoryPoint(now - 5 * 86400, 9.99, 3000),    # 窗口外
+           HistoryPoint(now - 2 * 86400, 1.12, 2500),
+           HistoryPoint(now - 1 * 86400, 1.15, 10),
+           HistoryPoint(now - 3600, 1.06, 3100),
+           HistoryPoint(now - 7200, 1.15, 0)]            # 没成交量的不算
+    s = sell_price_from_history(pts, 3, now)
+    assert (s.price, s.volume, s.ts) == (1.15, 10, now - 86400)
+    assert sell_price_from_history(pts, 0.5, now).price == 1.06
+    assert sell_price_from_history([], 3, now) is None
+
+
+def test_price_history_requires_login_and_parses(monkeypatch):
+    m = SteamMarket()
+    monkeypatch.setattr(m, "_throttle", lambda: None)
+    with pytest.raises(SteamLoginRequired):
+        m.price_history(730, "Kilowatt Case")
+
+    seen = {}
+
+    class Resp:
+        def __init__(self, code, body):
+            self.status_code, self._body = code, body
+
+        def json(self):
+            return self._body
+
+    replies = iter([Resp(200, {"success": True, "price_prefix": "¥ ", "prices": [
+        ["Oct 01 2026 01: +0", 1.08, "3514"], ["Oct 01 2026 02: +0", "1.1", "12"], ["bad", 1, 1]]}),
+        Resp(400, [])])
+
+    def fake_get(url, *, timeout, params):
+        seen["cookie"] = m._http.cookies.get("steamLoginSecure", domain="steamcommunity.com")
+        seen["params"] = params
+        return next(replies)
+    monkeypatch.setattr(m._http, "get", fake_get)
+    m.set_login("7656%7C%7Ctoken")
+    pts = m.price_history(730, "Kilowatt Case")
+    assert seen["cookie"] == "7656%7C%7Ctoken" and seen["params"]["market_hash_name"] == "Kilowatt Case"
+    assert [(p.price, p.volume) for p in pts] == [(1.08, 3514), (1.1, 12)]
+    # 登录态失效：Steam 回 400 + []
+    with pytest.raises(SteamLoginRequired, match="失效"):
+        m.price_history(730, "Kilowatt Case")
+    m.set_login(None)
+    assert m._http.cookies.get("steamLoginSecure", domain="steamcommunity.com") is None and not m.logged_in

@@ -139,3 +139,12 @@ footer { max-width: 1400px; margin: 24px auto 0; }
 .rate-form input:focus { outline: none; border-color: var(--accent); }
 @media (max-width: 900px) { .rate-form { border-right: none; padding-right: 0; margin-right: 0; width: 100%; } }
 .tile .value.small { font-size: 18px; }
+
+.login-form { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+.login-form input {
+  padding: 4px 8px; font: inherit; font-size: 13px; color: var(--ink); background: var(--page);
+  border: 1px solid var(--border); border-radius: 6px; min-width: 140px;
+}
+.login-form input:focus { outline: none; border-color: var(--accent); }
+#steam-code { min-width: 90px; width: 110px; }
+.login-form[hidden], .rate-form[hidden] { display: none; }
