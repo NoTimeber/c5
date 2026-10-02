@@ -13,7 +13,7 @@
 #   GITHUB_TOKEN   仓库是私有的时候用来下载文件（curl 本脚本时也要带 -H "Authorization: token ..."）
 set -euo pipefail
 
-REPO="${C5BOT_REPO:-CHANGE_ME/c5}"   # <- 推到 GitHub 前改成你的仓库
+REPO="${C5BOT_REPO:-NoTimeber/c5}"
 BRANCH="${C5BOT_BRANCH:-main}"
 DIR="${C5BOT_DIR:-/opt/c5bot}"
 RAW="https://raw.githubusercontent.com/${REPO}/${BRANCH}"
