@@ -5,7 +5,7 @@ import pytest
 from c5bot.config import load_settings, load_watchlist
 
 ENV_KEYS = ("C5_APP_KEY", "C5_MODE", "C5_LIVE_CONFIRM", "C5_TRADE_URL", "C5_MAX_TOTAL_SPEND",
-            "C5_STRATEGY", "C5_DATA_DIR", "C5_START_PAUSED")
+            "C5_STRATEGY", "C5_DATA_DIR", "C5_START_PAUSED", "STEAM_RATE_ITEM")
 TRADE_URL = "https://steamcommunity.com/tradeoffer/new/?partner=1&token=x"
 
 
@@ -77,3 +77,8 @@ def test_watchlist_rejects_bad_input(tmp_path, body):
     f.write_text(body, encoding="utf-8")
     with pytest.raises(SystemExit):
         load_watchlist(f)
+
+
+def test_steam_rate_item_default_and_override(env):
+    assert env(C5_APP_KEY="k").steam_rate_item == "AK-47 | Redline (Field-Tested)"
+    assert env(C5_APP_KEY="k", STEAM_RATE_ITEM=" Glock-18 | Fade (Factory New) ").steam_rate_item == "Glock-18 | Fade (Factory New)"

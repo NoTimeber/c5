@@ -111,7 +111,7 @@ def cmd_compare(s: Settings, every: float) -> int:
                 failed.append((it, c5, str(e)))
         rate: SteamRate | None = None
         try:
-            rate = fetch_steam_rate(steam, [(it, sp) for it, _, sp in priced])
+            rate = fetch_steam_rate(steam, s.steam_rate_item)
         except SteamError as e:
             print(f"Steam 汇率查询失败: {e}")
         print(f"\n{now}  Steam 价为当前最低挂单价，净到手 = 扣 Steam 5% + CS2 10% 手续费后。"

@@ -77,18 +77,16 @@ def target_price(disc: float | None, steam_lowest: float | None) -> float | None
     return v if v > 0 else None
 
 
-def fetch_steam_rate(steam: SteamMarket, priced: list[tuple[WatchItem, SteamPrice]]) -> SteamRate:
-    """挑价最高的饰品再查一次美元价，算 Steam 的人民币/美元换算率（价越高，分的取整误差越小）。
-    没有可用价格或查询失败抛 SteamError。"""
-    cands = [(it, sp) for it, sp in priced if sp.lowest]
-    if not cands:
-        raise SteamError("没有可用的 Steam 价，算不出汇率")
-    it, sp = max(cands, key=lambda x: x[1].lowest)
-    usd = steam.price(it.app_id, it.name, currency=USD).lowest
-    rate = steam_rate(sp.lowest, usd)
+def fetch_steam_rate(steam: SteamMarket, name: str, app_id: int = 730) -> SteamRate:
+    """用一件固定的参照饰品分别查钱包币种价和美元价，算 Steam 的换算率。
+    参照饰品要贵：Steam 换算后向上取整到分，几十美元的饰品误差在 0.03% 以内，几毛钱的箱子会差百分之几。
+    查询失败抛 SteamError。"""
+    cny = steam.price(app_id, name).lowest
+    usd = steam.price(app_id, name, currency=USD).lowest
+    rate = steam_rate(cny, usd)
     if rate is None:
-        raise SteamError(f"{it.name} 的 Steam 美元价无效")
-    return SteamRate(rate=rate, name=it.name, cny=sp.lowest, usd=usd, at=time.time())
+        raise SteamError(f"{name} 的 Steam 价无效，算不出汇率")
+    return SteamRate(rate=rate, name=name, cny=cny, usd=usd, at=time.time())
 
 
 def compare_row(item: WatchItem, c5: float | None, sp: SteamPrice | None, *,

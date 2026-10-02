@@ -131,10 +131,12 @@ def test_target_rate_loaded_at_start_and_waits_for_steam(tmp_path):
 
 def test_refresh_steam_fetches_rate_and_applies_targets(env, monkeypatch):
     dash, sweeper, client, web = env
+    ref = dash.s.steam_rate_item
     prices = {
         (CASE.name, None): SteamPrice(1.08, 1.08, 86298),
         (OTHER.name, None): SteamPrice(1.67, 1.67, 101052),
-        (OTHER.name, USD): SteamPrice(0.232, 0.232, 101052),  # 贵的那个查美元价
+        (ref, None): SteamPrice(243.00, 250.93, 93),   # 参照饰品查人民币价和美元价
+        (ref, USD): SteamPrice(36.05, 37.23, 93),
     }
     calls = []
 
@@ -144,9 +146,9 @@ def test_refresh_steam_fetches_rate_and_applies_targets(env, monkeypatch):
     monkeypatch.setattr(dash._steam, "price", fake_price)
     dash.set_target_rate(5.0)
     dash.refresh_steam()
-    assert calls == [(CASE.name, None), (OTHER.name, None), (OTHER.name, USD)]
-    assert dash.steam_rate.rate == pytest.approx(1.67 / 0.232) and dash.steam_rate.name == OTHER.name
-    disc = 5.0 / (1.67 / 0.232)
+    assert calls == [(CASE.name, None), (OTHER.name, None), (ref, None), (ref, USD)]
+    assert dash.steam_rate.rate == pytest.approx(243.00 / 36.05) and dash.steam_rate.name == ref
+    disc = 5.0 / (243.00 / 36.05)
     assert sweeper.auto_targets == {
         CASE.name: int(0.95 * disc * 100 + 1e-9) / 100,    # 1.08 -> 到手 0.95
         OTHER.name: int(1.46 * disc * 100 + 1e-9) / 100,   # 1.67 -> 到手 1.46
@@ -160,7 +162,7 @@ def test_refresh_steam_fetches_rate_and_applies_targets(env, monkeypatch):
         return prices[(name, currency)]
     monkeypatch.setattr(dash._steam, "price", flaky)
     dash.refresh_steam()
-    assert dash.steam_rate.rate == pytest.approx(1.67 / 0.232) and "429" in dash.steam_rate_error
+    assert dash.steam_rate.rate == pytest.approx(243.00 / 36.05) and "429" in dash.steam_rate_error
     assert sweeper.auto_targets[CASE.name] == int(0.95 * disc * 100 + 1e-9) / 100
 
 

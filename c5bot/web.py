@@ -125,7 +125,7 @@ class Dashboard:
                     old = self.steam.get(it.name) or {"price": None, "at": None}
                     self.steam[it.name] = {**old, "error": str(e)}
                     log.warning("Steam 价格 %s: %s", it.name, e)
-            self._refresh_rate(fresh)
+            self._refresh_rate()
             self.steam_at = time.time()
             self._apply_targets()
             stats = self.sweeper.view.get("stats") or {}
@@ -136,12 +136,12 @@ class Dashboard:
         finally:
             self.steam_busy = False
 
-    def _refresh_rate(self, fresh: list[tuple]) -> None:
-        """多查一次美元价算 Steam 汇率。失败就沿用上次的值，汇率一天也变不了多少。"""
+    def _refresh_rate(self) -> None:
+        """用参照饰品查人民币价和美元价算 Steam 汇率。失败就沿用上次的值，汇率一天也变不了多少。"""
         if self._stop.is_set():
             return
         try:
-            self.steam_rate = fetch_steam_rate(self._steam, fresh)
+            self.steam_rate = fetch_steam_rate(self._steam, self.s.steam_rate_item)
             self.steam_rate_error = None
         except SteamError as e:
             self.steam_rate_error = str(e)

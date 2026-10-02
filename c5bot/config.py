@@ -12,6 +12,8 @@ ROOT = Path(__file__).resolve().parent.parent
 
 MODES = ("dry", "live")
 STRATEGIES = ("listing", "quick")
+# 量 Steam 人民币/美元换算率用的参照饰品。要贵：Steam 换算后向上取整到分，几十美元的饰品误差 0.03% 以内
+STEAM_RATE_ITEM_DEFAULT = "AK-47 | Redline (Field-Tested)"
 
 
 @dataclass(frozen=True)
@@ -43,6 +45,7 @@ class Settings:
     steam_proxy: str | None = None      # 访问 Steam 市场用的代理，跟 C5 分开配
     steam_currency: int = 23            # Steam 钱包币种，23 = 人民币
     steam_refresh_sec: float = 600.0    # 看板多久刷新一次 Steam 价
+    steam_rate_item: str = STEAM_RATE_ITEM_DEFAULT  # 量 Steam 汇率用的参照饰品（Steam 市场英文名）
     ui_host: str = "127.0.0.1"          # 看板监听地址
     ui_port: int = 8766                 # 0 = 不开看板
     start_paused: bool = False          # 启动时先暂停扫货只看行情，等看板上点“继续”
@@ -94,6 +97,7 @@ def load_settings(env_file: Path | None = None) -> Settings:
         steam_proxy=os.getenv("STEAM_PROXY") or None,
         steam_currency=int(_float("STEAM_CURRENCY", 23)),
         steam_refresh_sec=_float("STEAM_REFRESH_SEC", 600.0),
+        steam_rate_item=(os.getenv("STEAM_RATE_ITEM") or "").strip() or STEAM_RATE_ITEM_DEFAULT,
         ui_host=os.getenv("C5_UI_HOST") or "127.0.0.1",
         ui_port=int(_float("C5_UI_PORT", 8766)),
         start_paused=(os.getenv("C5_START_PAUSED") or "").strip().lower() in ("yes", "true", "1"),

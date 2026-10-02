@@ -89,20 +89,21 @@ class FakeSteam:
         return r
 
 
-def test_fetch_steam_rate_uses_most_expensive_item():
-    cheap, dear = WatchItem("Kilowatt Case", 0.7, 1), WatchItem("Dreams & Nightmares Case", 6.0, 1)
-    steam = FakeSteam({(dear.name, USD): SteamPrice(1.40, 1.40, 1)})
-    r = fetch_steam_rate(steam, [(cheap, SteamPrice(1.08, 1.08, 1)), (dear, SteamPrice(10.07, 10.05, 1))])
-    assert r.name == dear.name and r.cny == 10.07 and r.usd == 1.40
-    assert r.rate == pytest.approx(10.07 / 1.40)
-    assert steam.calls == [(dear.name, USD)]  # 只多查一次，而且是贵的那个
+REF = "AK-47 | Redline (Field-Tested)"
+
+
+def test_fetch_steam_rate_queries_reference_item_in_both_currencies():
+    steam = FakeSteam({(REF, None): SteamPrice(243.00, 250.93, 93), (REF, USD): SteamPrice(36.05, 37.23, 93)})
+    r = fetch_steam_rate(steam, REF)
+    assert r.name == REF and r.cny == 243.00 and r.usd == 36.05
+    assert r.rate == pytest.approx(243.00 / 36.05)
+    assert steam.calls == [(REF, None), (REF, USD)]
 
 
 def test_fetch_steam_rate_errors():
     with pytest.raises(SteamError):
-        fetch_steam_rate(FakeSteam({}), [])
-    it = WatchItem("Kilowatt Case", 0.7, 1)
+        fetch_steam_rate(FakeSteam({(REF, None): SteamError("429")}), REF)
     with pytest.raises(SteamError):
-        fetch_steam_rate(FakeSteam({(it.name, USD): SteamError("429")}), [(it, SteamPrice(1.08, 1.08, 1))])
+        fetch_steam_rate(FakeSteam({(REF, None): SteamPrice(243.0, 250.0, 93), (REF, USD): SteamError("429")}), REF)
     with pytest.raises(SteamError):
-        fetch_steam_rate(FakeSteam({(it.name, USD): SteamPrice(None, None, None)}), [(it, SteamPrice(1.08, 1.08, 1))])
+        fetch_steam_rate(FakeSteam({(REF, None): SteamPrice(243.0, 250.0, 93), (REF, USD): SteamPrice(None, None, None)}), REF)
