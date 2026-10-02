@@ -11,7 +11,16 @@ from fastapi.testclient import TestClient
 from c5bot import __version__
 from c5bot.compare import SteamRate
 from c5bot.config import Settings, WatchItem
-from c5bot.steam import USD, HistoryPoint, PriceHistory, SteamError, SteamLoginRequired, SteamPrice, SteamRateLimited
+from c5bot.steam import (
+    USD,
+    HistoryPoint,
+    MarketPage,
+    PriceHistory,
+    SteamError,
+    SteamLoginRequired,
+    SteamPrice,
+    SteamRateLimited,
+)
 from c5bot.steam_login import SteamLoginError, SteamSession
 from c5bot.store import Store
 from c5bot.sweeper import Sweeper
@@ -33,7 +42,7 @@ OTHER = WatchItem(name="Revolution Case", max_price=1.0, max_qty=3)
 
 @pytest.fixture
 def env(tmp_path):
-    s = Settings(app_key="k", mode="dry", data_dir=tmp_path, max_total_spend=100.0)
+    s = Settings(app_key="k", mode="dry", data_dir=tmp_path, max_total_spend=100.0, steam_source="api")
     client, store, clock = FakeClient(), Store(tmp_path / "t.sqlite"), Clock()
     client.stats = {CASE.name: {"sellPrice": 0.65, "sellCount": 10, "purchaseMaxPrice": 0.6},
                     OTHER.name: {"sellPrice": 1.2, "sellCount": 5}}
@@ -451,7 +460,7 @@ def test_pool_rotates_accounts_and_cools_down_rate_limited_one(env, monkeypatch)
 
 def test_usd_wallet_mode(tmp_path, monkeypatch):
     """卖货账号是美元区：Steam 价、净到手都是美元，不量 Steam 汇率，目标价 = 到手美元 × 目标汇率。"""
-    s = Settings(app_key="k", mode="dry", data_dir=tmp_path, steam_currency=USD)
+    s = Settings(app_key="k", mode="dry", data_dir=tmp_path, steam_currency=USD, steam_source="api")
     client, store = FakeClient(), Store(tmp_path / "t.sqlite")
     client.stats = {CASE.name: {"sellPrice": 0.65, "sellCount": 10}}
     client.listings = [listing(1, 0.65)]
@@ -483,6 +492,71 @@ def test_usd_wallet_mode(tmp_path, monkeypatch):
     # 目标价 = 到手美元 × 目标汇率 = 0.16 × 5.2 = 0.832 -> 0.83
     assert kilo["c5_target"] == 0.83 and kilo["rate_at_target"] == pytest.approx(0.83 / 0.16)
     assert kilo["status"] == "hit" and len(st["purchases"]) == 1
+
+
+def test_page_source_is_default_and_feeds_prices_history_and_queue(tmp_path, monkeypatch):
+    """默认 STEAM_SOURCE=page：最低价、成交历史、卖单深度全从市场页来，不碰接口、不需要登录账号。"""
+    s = Settings(app_key="k", mode="dry", data_dir=tmp_path, steam_currency=USD)
+    assert s.steam_source == "page"
+    client, store = FakeClient(), Store(tmp_path / "t.sqlite")
+    client.stats = {CASE.name: {"sellPrice": 0.65, "sellCount": 10}, OTHER.name: {"sellPrice": 1.2, "sellCount": 5}}
+    sweeper = Sweeper(s, [CASE, OTHER], client, store, clock=Clock())
+    dash = Dashboard(s, sweeper, tmp_path / "t.sqlite", LogBuffer(), watchlist_path=tmp_path / "w.toml")
+    web = TestClient(create_app(dash))
+    now = time.time()
+    pages = {CASE.name: MarketPage(currency=USD, lowest=0.16,
+                                   history=[HistoryPoint(now - 7200, 0.17, 5783), HistoryPoint(now - 3600, 0.16, 2734),
+                                            HistoryPoint(now - 5 * 86400, 0.30, 100)],
+                                   sell_orders=[(0.16, 4990), (0.17, 27130), (0.18, 35243)], buy_orders=[(0.15, 1200)],
+                                   sell_more=(0.19, 651155)),
+             OTHER.name: SteamError("Steam 市场页 HTTP 500")}
+    calls = []
+
+    def fake_page(app_id, name):
+        calls.append(("page", name))
+        r = pages[name]
+        if isinstance(r, Exception):
+            raise r
+        return r
+    monkeypatch.setattr(dash._steam, "market_page", fake_page)
+    monkeypatch.setattr(dash._steam, "price", lambda app_id, name, **kw: calls.append(("price", name)) or SteamPrice(1.67, 1.67, 1))
+    monkeypatch.setattr(dash._steam, "price_history", lambda *a, **kw: calls.append(("history",)) or PriceHistory([]))
+    dash.set_target_rate(5.2)
+    dash.refresh_steam()
+    # 千瓦箱：页面成功，不再查接口；变革箱：页面失败回退到 priceoverview；没登录账号所以不查历史
+    assert calls == [("page", CASE.name), ("page", OTHER.name), ("price", OTHER.name)]
+    sweeper.run_cycle()
+    st = web.get("/api/state").json()
+    kilo, rev = st["items"]
+    assert st["steam_source"] == "page" and st["steam_login"]["count"] == 0
+    assert kilo["steam_lowest"] == 0.16 and kilo["steam_volume"] == 5783 + 2734
+    # 过去 3 天两个点共 8517 件，30% = 2555：0.17 这一档就有 5783 -> 挂 0.17
+    assert kilo["sell_src"] == "history" and kilo["steam_sell"] == 0.17 and kilo["sell_high"] == 0.17
+    assert kilo["queue_ahead"] == 4990 + 27130 and kilo["queue_min"] is False   # 挂 0.17：0.16 和 0.17 两档都排在前面
+    assert kilo["sell_orders"][0] == [0.16, 4990] and kilo["sell_more"] == [0.19, 651155]
+    assert kilo["steam_net"] == pytest.approx(0.15) and kilo["c5_target"] == 0.78   # 0.15 × 5.2 = 0.78
+    assert rev["steam_lowest"] == 1.67 and rev["sell_src"] == "lowest" and rev["queue_ahead"] is None
+    # 挂单价高过表里最后一个精确档位：合计桶里有一部分也排在前面但分不出，只给下限
+    dash.history[CASE.name]["sell"] = 0.25
+    kilo = web.get("/api/state").json()["items"][0]
+    assert kilo["queue_ahead"] == 4990 + 27130 + 35243 and kilo["queue_min"] is True
+
+
+def test_page_source_converts_usd_history_for_cny_wallet(env, monkeypatch):
+    """人民币钱包 + 页面是美元价（走美国代理时常见）：按 Steam 汇率换算。"""
+    dash, sweeper, client, web = env
+    dash.s = replace(dash.s, steam_source="page")
+    now = time.time()
+    monkeypatch.setattr(dash._steam, "price", lambda app_id, name, **kw: SteamPrice(243.0 if kw.get("currency") != USD else 36.05, 0, 1))
+    page = MarketPage(currency=USD, lowest=0.16, history=[HistoryPoint(now - 3600, 0.17, 5783)],
+                      sell_orders=[(0.16, 4990), (0.17, 27130)], buy_orders=[])
+    monkeypatch.setattr(dash._steam, "market_page", lambda app_id, name: page)
+    dash.refresh_steam()
+    kilo = web.get("/api/state").json()["items"][0]
+    rate = 243.0 / 36.05
+    assert kilo["steam_sell"] == round(0.17 * rate, 2) and kilo["sell_usd"] == 0.17
+    assert kilo["steam_lowest"] == round(0.16 * rate, 2)          # 最低价和卖单价也换成人民币
+    assert kilo["sell_orders"][0] == [round(0.16 * rate, 2), 4990] and kilo["queue_ahead"] == 4990 + 27130
 
 
 def test_access_token_renewed_before_use(env, monkeypatch):

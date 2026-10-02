@@ -97,7 +97,7 @@ def cmd_compare(s: Settings, every: float) -> int:
     """C5 最低价 vs Steam 最低挂单价，算 1 元 Steam 余额要花多少钱、1 美元余额花多少人民币。"""
     items = load_watchlist()
     client = make_client(s)
-    steam = SteamMarket(proxy=s.steam_proxy, currency=s.steam_currency, timeout=s.timeout)
+    steam = SteamMarket(proxy=s.steam_proxy, currency=s.steam_currency, timeout=s.timeout, user_agent=s.steam_user_agent)
     widths = [max(28, *(_width(it.name) + 2 for it in items)), 8, 8, 10, 8, 12, 12, 12, 10, 9]
     while True:
         stats = _fetch_stats(client, items)

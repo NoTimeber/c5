@@ -40,6 +40,7 @@ from .steam import (
     SteamError,
     SteamLoginRequired,
     SteamMarket,
+    SteamPrice,
     SteamRateLimited,
     check_proxy_url,
     fmt_wait,
@@ -101,7 +102,7 @@ class Dashboard:
         self.proxy_override: str | None = self._prefs.get("steam_proxy") or None
         self.proxy_exit_ip: str | None = None
         self._steam = SteamMarket(proxy=self.effective_proxy, currency=settings.steam_currency,
-                                  timeout=settings.timeout)
+                                  timeout=settings.timeout, user_agent=settings.steam_user_agent)
         self._client = C5Client(settings.app_key, proxy=settings.proxy, timeout=settings.timeout)
         self._refresh_now = threading.Event()
         self._stop = threading.Event()
@@ -154,6 +155,15 @@ class Dashboard:
             for it in items:
                 if self._stop.is_set():
                     return
+                if self.s.steam_source == "page":
+                    sp = self._refresh_from_page(it)
+                    if sp is not None:
+                        fresh.append((it, sp))
+                        continue
+                    if self._steam.blocked_for > 0:
+                        log.warning("Steam 限流，本轮剩下的饰品先跳过，沿用上次的价")
+                        break
+                    # 页面抓不到就回退到接口
                 try:
                     sp = self._steam.price(it.app_id, it.name)
                     self.steam[it.name] = {"price": sp, "at": time.time(), "error": None}
@@ -182,8 +192,70 @@ class Dashboard:
         finally:
             self.steam_busy = False
 
+    def _refresh_from_page(self, it) -> SteamPrice | None:
+        """从饰品市场页拿最低价、成交历史、卖单深度（匿名，不走被封的接口）。失败返回 None 让调用方回退到接口。"""
+        try:
+            page = self._steam.market_page(it.app_id, it.name)
+        except SteamError as e:
+            log.warning("Steam 市场页 %s: %s，改走接口", it.name, e)
+            return None
+        now = time.time()
+        # 页面币种跟访问地区走（走美国代理就是美元）；和钱包币种不一样时，美元按 Steam 汇率换算，别的币种不认
+        rate = 1.0
+        if page.currency is not None and page.currency != self.s.steam_currency:
+            if page.currency != USD:
+                log.warning("Steam 市场页 %s: 页面币种 %s 和 STEAM_CURRENCY 对不上，改走接口", it.name, page.currency)
+                return None
+            if not self.steam_rate:
+                log.warning("Steam 市场页 %s: 页面是美元价，还没拿到 Steam 汇率，改走接口", it.name)
+                return None
+            rate = self.steam_rate.rate
+
+        def conv(v):
+            return None if v is None else round(v * rate, 2)
+        last24 = [p for p in page.history if p.ts >= now - 86400]
+        sp = SteamPrice(lowest=conv(page.lowest), median=conv(page.history[-1].price) if page.history else None,
+                        volume=sum(p.volume for p in last24) or None)
+        self.steam[it.name] = {"price": sp, "at": now, "error": None,
+                               "orders": [(conv(p), c) for p, c in page.sell_orders[:12]],
+                               "orders_more": (conv(page.sell_more[0]), page.sell_more[1]) if page.sell_more else None}
+        if page.history:
+            self._apply_history(it, sp, page.history, page.currency)
+        else:
+            old = self.history.get(it.name) or {}
+            self.history[it.name] = {**old, "error": "市场页里没有成交历史"}
+        return sp
+
+    def _apply_history(self, it, sp: SteamPrice, points: list, currency: int | None) -> None:
+        """从成交历史点算挂单价。currency 是这些价格的币种：和 STEAM_CURRENCY 一样直接用；是美元就按 Steam 汇率换算。"""
+        old = self.history.get(it.name) or {"sell": None, "sell_usd": None, "volume": None, "total": None,
+                                            "high": None, "share": None, "at": None}
+        sell = sell_price_from_history(points, self.s.steam_sell_window_days, share=self.s.steam_sell_volume_share)
+        if sell is None:
+            self.history[it.name] = {**old, "error": f"最近 {self.s.steam_sell_window_days:g} 天没有成交记录"}
+            return
+        price, high, sell_usd = sell.price, sell.high, None
+        if currency is not None and currency != self.s.steam_currency:
+            if currency != USD:
+                self.history[it.name] = {**old, "error": f"成交历史的币种（{currency}）和 STEAM_CURRENCY 对不上"}
+                return
+            # 美元价：按 Steam 自己的换算率折成钱包币种
+            if not self.steam_rate:
+                self.history[it.name] = {**old, "error": "成交历史是美元价，等拿到 Steam 汇率后换算"}
+                return
+            sell_usd = sell.price
+            price = round(sell.price * self.steam_rate.rate, 2)
+            high = round(sell.high * self.steam_rate.rate, 2)
+        # 换算后仍和当前中位价差太多，多半是币种对不上，这种价不能用
+        if sp.median and not 0.5 <= price / sp.median <= 3:
+            self.history[it.name] = {**old, "error": "成交历史的币种和 STEAM_CURRENCY 对不上，检查登录账号的钱包区"}
+            log.warning("Steam 成交历史 %s: 历史价 %.2f 和当前中位价 %.2f 对不上，疑似币种不一致", it.name, price, sp.median)
+            return
+        self.history[it.name] = {"sell": price, "sell_usd": sell_usd, "volume": sell.volume, "total": sell.total,
+                                 "high": high, "share": sell.share, "at": time.time(), "error": None}
+
     def _refresh_history(self, it, sp) -> bool:
-        """拉一个饰品的成交历史，算挂单价。账号池里轮着取账号：被限流的歇一会儿、登录态失效的标出来，换下一个。
+        """接口路径：用账号池拉一个饰品的成交历史，算挂单价。被限流的账号歇一会儿、登录态失效的标出来，换下一个。
         返回还有没有可用账号（没有就不再给后面的饰品拉历史）。"""
         old = self.history.get(it.name) or {"sell": None, "sell_usd": None, "volume": None, "total": None,
                                             "high": None, "share": None, "at": None}
@@ -211,26 +283,8 @@ class Dashboard:
             usable = bool(self.pool.usable())
             self.history[it.name] = {**old, "error": "账号都在歇，下轮再试" if usable else "没有可用的 Steam 账号，请重新登录"}
             return usable
-        sell = sell_price_from_history(hist.points, self.s.steam_sell_window_days, share=self.s.steam_sell_volume_share)
-        if sell is None:
-            self.history[it.name] = {**old, "error": f"最近 {self.s.steam_sell_window_days:g} 天没有成交记录"}
-            return True
-        price, high, sell_usd = sell.price, sell.high, None
-        if hist.usd and self.s.steam_currency != USD:
-            # 登录的是美元区账号：成交历史是美元价，按 Steam 自己的换算率折成人民币
-            if not self.steam_rate:
-                self.history[it.name] = {**old, "error": "成交历史是美元价，等拿到 Steam 汇率后换算"}
-                return True
-            sell_usd = sell.price
-            price = round(sell.price * self.steam_rate.rate, 2)
-            high = round(sell.high * self.steam_rate.rate, 2)
-        # 换算后仍和当前中位价差太多，多半是钱包币种对不上（既不是人民币也不是美元），这种价不能用
-        if sp.median and not 0.5 <= price / sp.median <= 3:
-            self.history[it.name] = {**old, "error": "成交历史的币种和 STEAM_CURRENCY 对不上，检查登录账号的钱包区"}
-            log.warning("Steam 成交历史 %s: 历史价 %.2f 和当前中位价 %.2f 对不上，疑似币种不一致", it.name, price, sp.median)
-            return True
-        self.history[it.name] = {"sell": price, "sell_usd": sell_usd, "volume": sell.volume, "total": sell.total,
-                                 "high": high, "share": sell.share, "at": time.time(), "error": None}
+        # 接口不给币种编号，只有前缀：$ 是美元，其它当作和钱包币种一致（算出来对不上会被下面的核对拦住）
+        self._apply_history(it, sp, hist.points, USD if hist.usd else self.s.steam_currency)
         return True
 
     @property
@@ -464,6 +518,13 @@ class Dashboard:
             steam = self.steam.get(it.name) or {}
             h = self.history.get(it.name) or {}
             basis, src = self.sell_basis(it)
+            orders = steam.get("orders") or []
+            more = steam.get("orders_more")
+            # 挂 basis 这个价，前面排着多少件：该价及以下各精确档位在售之和。
+            # 挂单价高过表里最后一个精确档位时，“x 或更高”那个合计桶里有一部分也排在前面但分不出来，只能给下限
+            cap = round(basis, 2) + 1e-6 if basis else None   # 表里的档位是两位小数，挂单价按分比较
+            queue = sum(c for p, c in orders if p <= cap) if cap and orders and orders[0][0] <= cap else None
+            queue_min = bool(queue is not None and more and cap >= more[0])
             if qty >= it.max_qty or (it.max_spend and spent >= it.max_spend):
                 status = "done"
             elif pause_until.get(it.name, 0) > now:
@@ -483,6 +544,7 @@ class Dashboard:
                 "max_price": it.max_price, "target_auto": auto,
                 "sell_src": src, "sell_volume": h.get("volume"), "sell_total": h.get("total"),
                 "sell_high": h.get("high"), "sell_share": h.get("share"), "sell_usd": h.get("sell_usd"),
+                "queue_ahead": queue, "queue_min": queue_min, "sell_orders": orders[:6], "sell_more": more,
                 "history_error": h.get("error"),
                 "max_qty": it.max_qty, "max_spend": it.max_spend, "bought": qty, "spent": spent,
                 "steam_at": steam.get("at"), "steam_error": steam.get("error"),
@@ -494,7 +556,7 @@ class Dashboard:
             "mode": self.s.mode, "strategy": self.s.strategy, "paused": sw.paused,
             "poll_interval": self.s.poll_interval, "steam_refresh_sec": self.s.steam_refresh_sec,
             "sell_window_days": self.s.steam_sell_window_days, "sell_volume_share": self.s.steam_sell_volume_share,
-            "steam_currency": self.s.steam_currency, "usd_wallet": self.usd_wallet,
+            "steam_currency": self.s.steam_currency, "usd_wallet": self.usd_wallet, "steam_source": self.s.steam_source,
             "cycle": {"n": self.cycle_n, "at": self.cycle_at, "error": self.cycle_error,
                       "done": bool(view.get("done"))},
             "budget": {"total": self.s.max_total_spend,

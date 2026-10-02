@@ -83,10 +83,19 @@
     if (!on) $("#cycle-text").textContent = "看板断开";
   }
 
+  // 用户正在选中文字时不重建表格和日志，否则 2 秒一次的重绘会把选区冲掉，没法复制
+  function selectionInside(el) {
+    const sel = window.getSelection();
+    if (!sel || sel.isCollapsed || !sel.rangeCount) return false;
+    const node = sel.getRangeAt(0).commonAncestorContainer;
+    return el.contains(node.nodeType === 1 ? node : node.parentNode);
+  }
   function render() {
     renderTop();
-    renderKpis();
     renderRateForm();
+    const main = document.querySelector("main");
+    if (selectionInside(main)) return;   // 正在选中：只更新顶栏，内容区保持不动
+    renderKpis();
     renderItems();
     renderSteam();
     renderPurchases();
@@ -178,7 +187,9 @@
       let sellSub;
       if (i.sell_src === "history") {
         const pct = Math.round((i.sell_share || s.sell_volume_share) * 100);
-        sellSub = `<div class="sub-cell" title="最近 ${s.sell_window_days} 天共成交 ${int(i.sell_total)} 件，其中 ${int(i.sell_volume)} 件（${pct}%）在这个价或更高价成交；窗口内最高小时中位价 ${cur(i.sell_high)}${i.sell_usd != null ? `。登录账号是美元区，$${num(i.sell_usd, 3)} 按 Steam 汇率换算` : ""}">${s.sell_window_days} 天 ${pct}% 成交 ≥ 此价 · 最高 ${cur(i.sell_high)}</div>`;
+        const depth = (i.sell_orders || []).map((o) => `${cur(o[0])} ${int(o[1])} 件`).concat(i.sell_more ? [`${cur(i.sell_more[0])} 或更高 ${int(i.sell_more[1])} 件`] : []).join("；");
+        const queue = i.queue_ahead != null ? ` · 前面排 ${i.queue_min ? "≥ " : ""}${int(i.queue_ahead)} 件` : "";
+        sellSub = `<div class="sub-cell" title="最近 ${s.sell_window_days} 天共成交 ${int(i.sell_total)} 件，其中 ${int(i.sell_volume)} 件（${pct}%）在这个价或更高价成交；窗口内最高小时中位价 ${cur(i.sell_high)}${i.sell_usd != null ? `。成交历史是美元价，$${num(i.sell_usd, 3)} 按 Steam 汇率换算` : ""}${depth ? `。当前卖单：${depth}` : ""}">${s.sell_window_days} 天 ${pct}% 成交 ≥ 此价 · 最高 ${cur(i.sell_high)}${queue}</div>`;
       }
       else if (i.history_error) sellSub = `<div class="sub-cell down" title="${esc(i.history_error)}">按最低价（历史失败）</div>`;
       else sellSub = `<div class="sub-cell">按最低价</div>`;
@@ -290,12 +301,35 @@
       <tbody>${rows.join("")}</tbody></table>`;
   }
 
+  let logsKey = "";
   function renderLogs() {
     const lines = state.logs.slice().reverse();
+    const key = lines.length ? `${lines.length}:${lines[0].t}:${lines[lines.length - 1].t}` : "";
+    if (key === logsKey) return;        // 日志没变就不重建，选区和滚动位置都保得住
+    logsKey = key;
     $("#logs-sub").textContent = lines.length ? `最近 ${lines.length} 条` : "";
     $("#logs").innerHTML = lines.length
       ? lines.map((l) => `<div class="entry"><span class="t">${fmtTime(l.t)}</span><span class="lv ${esc(l.level)}">${esc(l.level)}</span><span class="body">${esc(l.msg)}</span></div>`).join("")
       : `<div class="empty">暂无日志</div>`;
+  }
+  function logsAsText() {
+    return (state ? state.logs : []).map((l) => `${fmtTime(l.t, true)} ${l.level} ${l.msg}`).join("\n");
+  }
+  async function copyText(text) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand("copy");
+      ta.remove();
+      return ok;
+    }
   }
 
   // ---- 交互 ----------------------------------------------------------
@@ -303,6 +337,12 @@
   $("#btn-steam").addEventListener("click", () => post("/api/steam/refresh"));
   $("#btn-reload").addEventListener("click", () => post("/api/watchlist/reload"));
   $("#btn-orders").addEventListener("click", () => post("/api/orders/refresh"));
+  $("#btn-copy-logs").addEventListener("click", async () => {
+    const btn = $("#btn-copy-logs");
+    const ok = await copyText(logsAsText());
+    btn.textContent = ok ? "已复制" : "复制失败";
+    setTimeout(() => { btn.textContent = "复制"; }, 1500);
+  });
   $("#rate-form").addEventListener("submit", (e) => {
     e.preventDefault();
     const v = $("#rate-input").value.trim();

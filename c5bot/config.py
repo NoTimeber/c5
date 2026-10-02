@@ -48,6 +48,8 @@ class Settings:
     steam_rate_item: str = STEAM_RATE_ITEM_DEFAULT  # 量 Steam 汇率用的参照饰品（Steam 市场英文名）
     steam_sell_window_days: float = 3.0  # 登录 Steam 后，挂单价按最近几天的成交历史算
     steam_sell_volume_share: float = 0.3  # 挂单价 = 从高价往下累计成交量达到总量这个比例时的价（0.3 = 30% 的成交在此价或更高）
+    steam_user_agent: str = "browser"     # 访问 Steam 用的 UA：browser 真实浏览器 UA + 配套头（默认）/ bot 老实报名字 / 其它 = 固定字符串
+    steam_source: str = "page"            # page：抓饰品市场页解析（匿名、不被按 IP 封接口，默认）；api：priceoverview + 登录账号查 pricehistory
     ui_host: str = "127.0.0.1"          # 看板监听地址
     ui_port: int = 8766                 # 0 = 不开看板
     start_paused: bool = False          # 启动时先暂停扫货只看行情，等看板上点“继续”
@@ -102,6 +104,8 @@ def load_settings(env_file: Path | None = None) -> Settings:
         steam_rate_item=(os.getenv("STEAM_RATE_ITEM") or "").strip() or STEAM_RATE_ITEM_DEFAULT,
         steam_sell_window_days=_float("STEAM_SELL_WINDOW_DAYS", 3.0),
         steam_sell_volume_share=min(max(_float("STEAM_SELL_VOLUME_SHARE", 0.3), 0.001), 1.0),
+        steam_user_agent=(os.getenv("STEAM_USER_AGENT") or "").strip() or "browser",
+        steam_source="api" if (os.getenv("STEAM_SOURCE") or "").strip().lower() == "api" else "page",
         ui_host=os.getenv("C5_UI_HOST") or "127.0.0.1",
         ui_port=int(_float("C5_UI_PORT", 8766)),
         start_paused=(os.getenv("C5_START_PAUSED") or "").strip().lower() in ("yes", "true", "1"),
