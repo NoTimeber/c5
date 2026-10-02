@@ -33,13 +33,15 @@ from .compare import (
     target_price,
 )
 from .config import ROOT, Settings, load_watchlist
-from .steam import SteamError, SteamMarket, SteamPrice
+from .steam import SteamError, SteamMarket, SteamPrice, fmt_wait
 from .store import Store
 from .sweeper import Sweeper
 
 log = logging.getLogger(__name__)
 STATIC_DIR = Path(__file__).parent / "static"
 BALANCE_REFRESH_SEC = 60.0
+RATE_REFRESH_SEC = 3600.0       # Steam 汇率多久重新量一次：它一天也变不了多少，少打两次 Steam
+MANUAL_REFRESH_MIN_SEC = 60.0   # 看板上手动“刷新 Steam 价”的最小间隔
 STEAM_STALE_FACTOR = 3          # Steam 价超过这么多个刷新周期没更新，按汇率算目标价时当作没有
 SETTINGS_FILE = "dashboard.json"
 RATE_MIN, RATE_MAX = 0.1, 100.0  # 目标汇率合法范围（人民币 / 1 美元）
@@ -126,6 +128,9 @@ class Dashboard:
                     old = self.steam.get(it.name) or {"price": None, "at": None}
                     self.steam[it.name] = {**old, "error": str(e)}
                     log.warning("Steam 价格 %s: %s", it.name, e)
+                    if self._steam.blocked_for > 0:
+                        log.warning("Steam 限流，本轮剩下的饰品先跳过，沿用上次的价")
+                        break
             self._refresh_rate()
             self.steam_at = time.time()
             self._apply_targets()
@@ -137,9 +142,16 @@ class Dashboard:
         finally:
             self.steam_busy = False
 
+    @property
+    def steam_blocked_for(self) -> float:
+        """被 Steam 限流时还要等多少秒，0 = 正常。"""
+        return self._steam.blocked_for
+
     def _refresh_rate(self) -> None:
-        """用参照饰品查人民币价和美元价算 Steam 汇率。失败就沿用上次的值，汇率一天也变不了多少。"""
-        if self._stop.is_set():
+        """用参照饰品查人民币价和美元价算 Steam 汇率，最多每 RATE_REFRESH_SEC 量一次。失败就沿用上次的值。"""
+        if self._stop.is_set() or self._steam.blocked_for > 0:
+            return
+        if self.steam_rate and time.time() - self.steam_rate.at < RATE_REFRESH_SEC:
             return
         try:
             self.steam_rate = fetch_steam_rate(self._steam, self.s.steam_rate_item)
@@ -260,7 +272,7 @@ class Dashboard:
                        "spent": sum(t.spent for t in totals.values()),
                        "qty": sum(t.qty for t in totals.values())},
             "balance": {"value": self.balance, "at": self.balance_at},
-            "steam": {"at": self.steam_at, "busy": self.steam_busy},
+            "steam": {"at": self.steam_at, "busy": self.steam_busy, "blocked_for": self.steam_blocked_for},
             "rate": {"target": self.target_rate, "discount": self.discount(),
                      "steam": asdict(self.steam_rate) if self.steam_rate else None,
                      "steam_error": self.steam_rate_error},
@@ -305,6 +317,13 @@ def create_app(dash: Dashboard) -> FastAPI:
     async def steam_refresh() -> JSONResponse:
         if dash.steam_busy:
             return JSONResponse({"ok": False, "error": "正在刷新"}, status_code=409)
+        blocked = dash.steam_blocked_for
+        if blocked > 0:
+            return JSONResponse({"ok": False, "error": f"Steam 限流中，{fmt_wait(blocked)}后会自动重试"}, status_code=429)
+        since = time.time() - (dash.steam_at or 0.0)
+        if since < MANUAL_REFRESH_MIN_SEC:
+            return JSONResponse({"ok": False, "error": f"刚刷新过，{fmt_wait(MANUAL_REFRESH_MIN_SEC - since)}后再点"},
+                                status_code=429)
         dash.request_steam_refresh()
         return JSONResponse({"ok": True})
 

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import time
+from dataclasses import replace
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -9,7 +12,7 @@ from c5bot.config import Settings, WatchItem
 from c5bot.steam import USD, SteamError, SteamPrice
 from c5bot.store import Store
 from c5bot.sweeper import Sweeper
-from c5bot.web import Dashboard, LogBuffer, create_app
+from c5bot.web import RATE_REFRESH_SEC, Dashboard, LogBuffer, create_app
 from tests.test_sweeper import Clock, FakeClient, listing
 
 CASE = WatchItem(name="Kilowatt Case", max_price=0.7, max_qty=3)
@@ -157,7 +160,14 @@ def test_refresh_steam_fetches_rate_and_applies_targets(env, monkeypatch):
     }
     assert (dash.s.data_dir / "compare.csv").exists()
 
-    # 美元价查失败：沿用上次的汇率，目标价照常
+    # 一小时内再刷新：只查箱子，不再量汇率
+    calls.clear()
+    dash.refresh_steam()
+    assert calls == [(CASE.name, None), (OTHER.name, None)]
+
+    # 汇率过期后重新量，美元价查失败：沿用上次的汇率，目标价照常
+    dash.steam_rate = replace(dash.steam_rate, at=time.time() - RATE_REFRESH_SEC - 1)
+
     def flaky(app_id, name, *, currency=None):
         if currency == USD:
             raise SteamError("Steam 限流（429）")
@@ -166,6 +176,44 @@ def test_refresh_steam_fetches_rate_and_applies_targets(env, monkeypatch):
     dash.refresh_steam()
     assert dash.steam_rate.rate == pytest.approx(243.00 / 36.05) and "429" in dash.steam_rate_error
     assert sweeper.auto_targets[CASE.name] == int(0.95 * disc * 100 + 1e-9) / 100
+
+
+def test_refresh_stops_hammering_steam_when_rate_limited(env, monkeypatch):
+    dash, sweeper, client, web = env
+    gets = []
+
+    class Resp:
+        status_code = 429
+
+        def json(self):
+            return {}
+
+    def fake_get(url, *, timeout, params):
+        gets.append(params["market_hash_name"])
+        return Resp()
+    monkeypatch.setattr(dash._steam._http, "get", fake_get)
+    monkeypatch.setattr(dash._steam, "_throttle", lambda: None)
+    dash.refresh_steam()
+    # 第一个饰品被 429 后，剩下的饰品和汇率都不再请求
+    assert gets == [CASE.name]
+    st = web.get("/api/state").json()
+    assert 0 < st["steam"]["blocked_for"] <= 300
+    assert "429" in st["items"][0]["steam_error"] and st["items"][1]["steam_error"] is None
+    assert dash.steam_rate is None
+    r = web.post("/api/steam/refresh")
+    assert r.status_code == 429 and "限流" in r.json()["error"]
+    # 退避期内再刷新也不发请求
+    dash.refresh_steam()
+    assert gets == [CASE.name]
+
+
+def test_manual_refresh_throttled(env):
+    dash, sweeper, client, web = env
+    dash.steam_at = time.time()
+    r = web.post("/api/steam/refresh")
+    assert r.status_code == 429 and "刚刷新过" in r.json()["error"]
+    dash.steam_at = time.time() - 120
+    assert web.post("/api/steam/refresh").json() == {"ok": True}
 
 
 def test_reload_watchlist_recomputes_targets(env, tmp_path):

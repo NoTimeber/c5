@@ -12,7 +12,8 @@ USD = 1                 # Steam 币种编号：1 美元，23 人民币
 STEAM_FEE_PCT = 5       # Steam 交易手续费 5%
 GAME_FEE_PCT = 10       # CS2 游戏手续费 10%
 MIN_INTERVAL = 3.0      # 未登录状态大约每分钟 20 次，再快就 429
-RETRY_WAIT = 30.0       # 被 429 后等多久再试一次
+BLOCK_SEC = 300.0       # 被 429 后多久内不再请求 Steam；连续被限流退避翻倍
+BLOCK_MAX_SEC = 3600.0
 
 
 class SteamError(Exception):
@@ -55,8 +56,14 @@ def discount(c5_price: float, steam_price: float | None) -> float | None:
     return c5_price / net if net > 0 else None
 
 
+def fmt_wait(sec: float) -> str:
+    sec = max(1, round(sec))
+    return f"{-(-sec // 60)} 分钟" if sec >= 60 else f"{sec} 秒"
+
+
 class SteamMarket:
-    def __init__(self, *, proxy: str | None = None, currency: int = 23, timeout: float = 10.0):
+    def __init__(self, *, proxy: str | None = None, currency: int = 23, timeout: float = 10.0,
+                 clock=time.monotonic):
         self._http = requests.Session()
         self._http.headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) c5bot"
         # 实测 Accept-Encoding 里只要有 br，Steam 就直接回 429；requests 装了 brotli 后默认会带上
@@ -65,24 +72,36 @@ class SteamMarket:
             self._http.proxies = {"http": proxy, "https": proxy}
         self._currency = currency
         self._timeout = timeout
+        self._now = clock
         self._last = 0.0
+        self._blocked_until = 0.0       # 被限流后这个时间之前不再请求
+        self._block_sec = BLOCK_SEC     # 下次被限流退避多久，连续被限流翻倍
+
+    @property
+    def blocked_for(self) -> float:
+        """还要等多少秒才会再请求 Steam；0 = 没被限流。"""
+        return max(0.0, self._blocked_until - self._now())
 
     def price(self, app_id: int, name: str, *, currency: int | None = None) -> SteamPrice:
-        """当前最低挂单价等。currency 不传用初始化时的币种（默认人民币），传 USD 查美元价。"""
-        for attempt in (1, 2):
-            self._throttle()
-            try:
-                resp = self._http.get(PRICE_OVERVIEW, timeout=self._timeout, params={
-                    "appid": app_id, "currency": self._currency if currency is None else currency,
-                    "market_hash_name": name})
-            except requests.RequestException as e:
-                raise SteamError(f"Steam 网络错误: {type(e).__name__}") from None
-            if resp.status_code != 429:
-                break
-            if attempt == 1:
-                time.sleep(RETRY_WAIT)
-        else:
-            raise SteamError("Steam 限流（429），过几分钟再试")
+        """当前最低挂单价等。currency 不传用初始化时的币种（默认人民币），传 USD 查美元价。
+        被 Steam 限流（429 / 403）后 BLOCK_SEC 内直接抛 SteamError、不发请求；连续被限流退避时间翻倍。
+        被限流后继续请求只会把封锁拖长，所以不做逐个重试。"""
+        wait = self.blocked_for
+        if wait > 0:
+            raise SteamError(f"Steam 限流中，{fmt_wait(wait)}后再试")
+        self._throttle()
+        try:
+            resp = self._http.get(PRICE_OVERVIEW, timeout=self._timeout, params={
+                "appid": app_id, "currency": self._currency if currency is None else currency,
+                "market_hash_name": name})
+        except requests.RequestException as e:
+            raise SteamError(f"Steam 网络错误: {type(e).__name__}") from None
+        if resp.status_code in (429, 403):
+            block = self._block_sec
+            self._blocked_until = self._now() + block
+            self._block_sec = min(block * 2, BLOCK_MAX_SEC)
+            raise SteamError(f"Steam 限流（{resp.status_code}），{fmt_wait(block)}内不再请求 Steam")
+        self._block_sec = BLOCK_SEC  # 正常拿到响应就把退避复位
         try:
             data = resp.json()
         except ValueError:
@@ -95,7 +114,7 @@ class SteamMarket:
                           volume=int(volume) if volume else None)
 
     def _throttle(self) -> None:
-        wait = self._last + MIN_INTERVAL - time.monotonic()
+        wait = self._last + MIN_INTERVAL - self._now()
         if wait > 0:
             time.sleep(wait)
-        self._last = time.monotonic()
+        self._last = self._now()

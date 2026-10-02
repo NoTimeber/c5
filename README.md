@@ -42,7 +42,7 @@ uv run python -m c5bot orders                       # 同步订单状态、看�
 uv run python -m c5bot compare --every 30           # 每 30 分钟重算一次，结果追加到 data/compare.csv
 ```
 
-注意：C5 买到的饰品要 7 天后才能挂 Steam 市场卖，折扣是按今天的 Steam 价算的。`--every` 跑几天、看 `compare.csv` 里 Steam 价的波动，能大致估计这 7 天的风险。Steam 市场接口对未登录请求限流很严（约每分钟 20 次），脚本每次请求间隔 3 秒，被 429 时等 30 秒重试一次。
+注意：C5 买到的饰品要 7 天后才能挂 Steam 市场卖，折扣是按今天的 Steam 价算的。`--every` 跑几天、看 `compare.csv` 里 Steam 价的波动，能大致估计这 7 天的风险。Steam 市场接口对未登录请求限流很严（约每分钟 20 次），脚本每次请求间隔 3 秒；被 429 后 5 分钟内不再请求 Steam，连续被限流退避时间翻倍（最多 1 小时），期间沿用上次的价。
 
 ### 网页看板
 
@@ -177,6 +177,7 @@ docker run -d --name watchtower --restart unless-stopped \
 - 服务器在国内拉不动 `ghcr.io` 的话，改推阿里云容器镜像服务（个人版免费）：在 GitHub 仓库 Settings → Secrets and variables → Actions 设 Variables `C5_REGISTRY`、`C5_IMAGE` 和 Secrets `C5_REGISTRY_USER`、`C5_REGISTRY_PASSWORD`；服务器安装时传 `C5BOT_IMAGE=<阿里云镜像名>` 和阿里云账号的 `GHCR_USER` / `GHCR_TOKEN`（变量名沿用，登录的是镜像名里的那个注册表）。
 - `compose.yaml` 由脚本管理，每次 `upgrade` 覆盖，别在服务器上手改；所有自定义都放 `.env`。改 `watchlist.toml` 不用重启，看板上点“重载 watchlist”；改 `.env` 跑 `restart`。
 - 只看行情不买：`.env` 里 `C5_START_PAUSED=yes`，在看板上点“继续扫货”才开始买。
+- Steam 市场接口对匿名请求限流严，云服务器的 IP 更容易被 429。被限流后看板 5 分钟内不再请求 Steam（连续被限翻倍到最多 1 小时），期间沿用旧价，“Steam 价”卡片会显示限流中并自动重试；Steam 汇率每小时才重新量一次，手动“刷新 Steam 价”至少间隔 1 分钟。频繁被限流就配 `STEAM_PROXY` 换一个出口 IP，或调大 `STEAM_REFRESH_SEC`。
 - `docker stop` 发 SIGTERM，程序按 Ctrl+C 同样的路径退出；正在发的下单请求最坏也就是记成“结果未知”，下次启动自动对账。
 - 不经过 CI 在本机 build：`docker compose -f compose.yaml -f compose.build.yaml up -d --build`。
 - 本机没装 Docker 也没有 bash，Dockerfile、workflow、install.sh 都没有实际跑过；第一次失败的话把输出贴出来。

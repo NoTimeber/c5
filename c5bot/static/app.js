@@ -96,8 +96,9 @@
     pauseBtn.textContent = s.paused ? "继续扫货" : "暂停扫货";
     pauseBtn.className = "ghost " + (s.paused ? "primary" : "danger");
     $("#btn-orders").hidden = s.mode !== "live";
-    $("#btn-steam").disabled = !!s.steam.busy;
-    $("#btn-steam").textContent = s.steam.busy ? "刷新中…" : "刷新 Steam 价";
+    const blocked = s.steam.blocked_for > 0;
+    $("#btn-steam").disabled = !!s.steam.busy || blocked;
+    $("#btn-steam").textContent = s.steam.busy ? "刷新中…" : blocked ? "Steam 限流中" : "刷新 Steam 价";
   }
 
   function renderKpis() {
@@ -115,7 +116,9 @@
       s.mode === "live"
         ? tile("C5 余额", num(s.balance.value), s.balance.at ? `${ago(s.balance.at)} 更新` : "还没查到")
         : tile("C5 余额", "模拟", "dry 模式不查余额也不花钱"),
-      tile("Steam 价", s.steam.at ? ago(s.steam.at) : "未拉取", `每 ${Math.round(s.steam_refresh_sec / 60)} 分钟刷新`),
+      s.steam.blocked_for > 0
+        ? tile("Steam 价", "限流中", `Steam 429，约 ${Math.ceil(s.steam.blocked_for / 60)} 分钟后自动重试，期间沿用旧价`, "down small")
+        : tile("Steam 价", s.steam.at ? ago(s.steam.at) : "未拉取", `每 ${Math.round(s.steam_refresh_sec / 60)} 分钟刷新`),
       sr
         ? tile("Steam 汇率", `${num(sr.rate, 3)} <span class="muted">元/USD</span>`, `按 ${esc(sr.name)} ¥${num(sr.cny)} / $${num(sr.usd)} · ${ago(sr.at)}`)
         : tile("Steam 汇率", "未知", r.steam_error ? esc(r.steam_error) : "等第一次 Steam 刷新", "small"),

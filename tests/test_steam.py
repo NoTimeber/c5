@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from c5bot.steam import USD, SteamMarket, discount, parse_money, seller_receives
+from c5bot.steam import BLOCK_SEC, USD, SteamError, SteamMarket, discount, fmt_wait, parse_money, seller_receives
 
 
 def test_steam_session_never_advertises_brotli():
@@ -53,3 +53,44 @@ def test_price_currency_override(monkeypatch):
     assert m.price(730, "Kilowatt Case").lowest == 1.40
     assert m.price(730, "Kilowatt Case", currency=USD).lowest == 1.40
     assert seen == [23, USD]
+
+
+def test_fmt_wait():
+    assert fmt_wait(45) == "45 秒" and fmt_wait(300) == "5 分钟" and fmt_wait(90) == "2 分钟"
+
+
+def test_429_blocks_further_requests_with_backoff(monkeypatch):
+    now = [1000.0]
+    m = SteamMarket(clock=lambda: now[0])
+    codes = iter([429, 429, 200])
+    calls = []
+
+    class Resp:
+        def __init__(self, code):
+            self.status_code = code
+
+        def json(self):
+            return {"success": True, "lowest_price": "¥ 1.08", "median_price": "¥ 1.08", "volume": "1"}
+
+    def fake_get(url, *, timeout, params):
+        calls.append(now[0])
+        return Resp(next(codes))
+    monkeypatch.setattr(m._http, "get", fake_get)
+    monkeypatch.setattr(m, "_throttle", lambda: None)
+
+    with pytest.raises(SteamError, match="限流"):
+        m.price(730, "Kilowatt Case")
+    assert m.blocked_for == pytest.approx(BLOCK_SEC)
+    # 退避期内直接报错，不发请求
+    with pytest.raises(SteamError, match="限流中"):
+        m.price(730, "Kilowatt Case")
+    assert len(calls) == 1
+    # 退避到期后再试，又被限流 -> 退避翻倍
+    now[0] += BLOCK_SEC
+    with pytest.raises(SteamError):
+        m.price(730, "Kilowatt Case")
+    assert len(calls) == 2 and m.blocked_for == pytest.approx(BLOCK_SEC * 2)
+    # 再到期，成功一次就复位
+    now[0] += BLOCK_SEC * 2
+    assert m.price(730, "Kilowatt Case").lowest == 1.08
+    assert m.blocked_for == 0 and m._block_sec == BLOCK_SEC
